@@ -29,3 +29,7 @@ Thumbs.db
 # Temporary notebooks and archives
 .ipynb_checkpoints/
 *.zip
+
+# Optional local raw inputs
+data/raw/*.csv
+data/raw/*.xlsx
