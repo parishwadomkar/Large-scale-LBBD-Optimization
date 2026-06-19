@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+
+# Solver and run outputs
+runs/
+logs/*
+!logs/.gitkeep
+*.lp
+*.mps
+*.mst
+*.sol
+*.log
+
+# Local data are not tracked in this repository
+data/raw/small/
+data/raw/full/
+data/processed/
+
+# IDE and OS files
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Temporary notebooks and archives
+.ipynb_checkpoints/
+*.zip
