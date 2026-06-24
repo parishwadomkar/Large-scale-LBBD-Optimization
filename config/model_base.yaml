@@ -2,14 +2,11 @@ speed_car_kmh: 30.0
 speed_walk_kmh: 6.0
 value_time_sek_per_h: 80.0
 max_redirection_distance_km: 1.5
-
 representative_day: true
 time_slots_per_day: 48
 slot_hours: 0.5
-
-pv_panel_kwp: 0.4
+pv_panel_kwp: 0.5
 battery_cell_kwh: 10.0
-
 allow_redirection: true
 use_charger_type_aware_redirection: false
 use_benchmark_reference_tariff: false

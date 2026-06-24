@@ -191,18 +191,7 @@ python src_lbbd\run_lbbd.py --dataset full --scenario no_redirection --preset fu
 
 ## Outputs
 
-Each run writes to a timestamped folder under `runs/`:
-
-```text
-runs/<timestamp>_<dataset>_<scenario>_LBBD_<technology>/
-├── logs/
-├── master/
-├── subproblems/
-├── iterations/
-└── results/
-```
-
-Main result files:
+Main result files (in runs folder):
 
 | File | Contents |
 |---|---|

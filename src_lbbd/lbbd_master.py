@@ -238,6 +238,20 @@ def build_master_model(data: dict, cfg: dict, scenario: str):
         for idx in m.pv_batt:
             m.pv_batt[idx].fix(0.0)
 
+    if data.get("disable_bess", False):
+        for idx in m.Batt:
+            m.Batt[idx].fix(0)
+        for idx in m.grid_batt:
+            m.grid_batt[idx].fix(0.0)
+        for idx in m.pv_batt:
+            m.pv_batt[idx].fix(0.0)
+        for idx in m.batt_discharge:
+            m.batt_discharge[idx].fix(0.0)
+        for idx in m.soc:
+            m.soc[idx].fix(0.0)
+        for idx in m.delta:
+            m.delta[idx].fix(0)
+
     if scenario == "no_redirection":
         for idx in m.R:
             m.R[idx].fix(0.0)

@@ -1,0 +1,3 @@
+Metric,Value
+bound_note,UB is continuous-redirection LP relaxation with PV+BESS master; LB is feasible MIP trip-bundle reconstruction.
+BESS_note,"BESS sizing, charge/discharge exclusivity, and 12-month linked SoC are retained in the master. Redirected demand is conservatively costed as grid-supplied in the redirection subproblem."

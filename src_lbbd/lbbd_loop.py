@@ -152,7 +152,7 @@ def run_lbbd_iterations(
     min_cut_violation = cut_tolerance if min_cut_violation is None else float(min_cut_violation)
     mip_reconstruction_frequency = max(1, int(mip_reconstruction_frequency or 1))
 
-    print("Building PV+BESS LBBD master model...")
+    print("Building LBBD master model...")
     if cut_strategy == "corepoint":
         print("Acceleration       : core-point/Pareto dual cut selection enabled")
     if max_cuts_per_iteration:
