@@ -2,18 +2,18 @@
   "default_dataset": "small",
   "datasets": {
     "small": {
-      "demand_shapefile": "data/raw/small/demandHexGrid.gpkg",
-      "distance_csv": "data/raw/small/shortestpath.csv",
-      "parking_shapefile": "data/raw/small/CharParksmall.shp"
+      "demand_shapefile": "data/small/demandHexGrid.gpkg",
+      "distance_csv": "data/small/shortestpath.csv",
+      "parking_shapefile": "data/small/CharParksmall.shp"
     },
     "full": {
-      "demand_shapefile": "data/raw/full/demandHexGrid_optimization_full.gpkg",
-      "distance_csv": "data/raw/full/shortestpath.csv",
-      "parking_shapefile": "data/raw/full/CharParkfull.shp"
+      "demand_shapefile": "data/full/demandHexGrid_optimization_full.gpkg",
+      "distance_csv": "data/full/shortestpath.csv",
+      "parking_shapefile": "data/full/CharParkfull.shp"
     }
   },
-  "pvgis_excel": "data/raw/PVGISdata.xlsx",
-  "spot_price_csv": "data/raw/ElPrice.csv",
+  "pvgis_excel": "data/PVGISdata.xlsx",
+  "spot_price_csv": "data/ElPrice.csv",
   "runs_root": "runs"
 }
 
