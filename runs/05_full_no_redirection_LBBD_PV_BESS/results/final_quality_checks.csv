@@ -1,7 +1,0 @@
-check,passed,value,threshold,note
-lbbd_gap_within_target,True,0.0,0.025,percent
-slack_penalty_effectively_zero,True,0.0,<= 1e-3 SEK,
-soc_month_link_gap_within_numerical_tolerance,False,4.18006814940577,<= 2.473 kWh,"adaptive tolerance: max(1 kWh, 0.01% of installed BESS energy capacity)"
-annual_profit_present,True,502020325.24377334,numeric,
-pv_panels_present,True,78942.0,numeric,
-battery_units_present,True,2473.0,numeric,

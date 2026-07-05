@@ -2,7 +2,7 @@ solver: gurobi
 tee: true
 threads: 10
 mip_gap: 0.0001
-time_limit_seconds: 96600
+time_limit_seconds: 99600
 presolve: 2
 numeric_focus: 2
 heuristics: 0.1

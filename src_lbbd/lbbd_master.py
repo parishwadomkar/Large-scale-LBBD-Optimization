@@ -1,325 +1,170 @@
 from __future__ import annotations
 
 import math
-from pyomo.environ import (
-    Any,
-    Binary,
-    ConcreteModel,
-    Constraint,
-    ConstraintList,
-    NonNegativeIntegers,
-    NonNegativeReals,
-    Objective,
-    Param,
-    Set,
-    Var,
-    maximize,
-    quicksum,
-    value,
-)
+import pyomo.environ as pyo
 
 
-def compute_theta_upper_bounds(data: dict, cfg: dict) -> dict[tuple[str, int], float]:
-    out: dict[tuple[str, int], float] = {}
-    prices = data["charger_price"]
-    delta = data["delta_price"]
-    x_kwh = float(cfg["x_kwh_per_trip"])
-    for mon in data["MONTHS"]:
-        for t in data["INTERVALS"]:
-            max_margin = 0.0
-            for (i, j, m2, t2) in data["allowed_st"]:
-                if m2 != mon or t2 != t:
-                    continue
-                dist_cost = data["T_dict"].get((int(i), int(j)), 0.0) / x_kwh
-                for co in data["PUB_TYPES"]:
-                    for cd in data["PUB_TYPES"]:
-                        margin = prices[cd] - data["tou"][mon][t] - delta[(co, cd)] - dist_cost
-                        if margin > max_margin:
-                            max_margin = float(margin)
-            public_demand = sum(float(data["demand_event_annual"][(i, mon, t, "public")]) for i in data["hex_ids"])
-            out[(mon, t)] = max(0.0, data["N_MONTH"][mon] * max_margin * public_demand)
-    return out
+def build_lbbd_master(data: dict, cfg: dict, scenario: str = "with_redirection"):
+    m = pyo.ConcreteModel()
+    I, M, H, Hsoc = data["hex_ids"], data["MONTHS"], data["INTERVALS"], data["HSOC"]
+    C, B, A = data["PUB_TYPES"], data["DEMAND_CLASSES"], data["allowed_st"]
+    m.I = pyo.Set(initialize=I)
+    m.M = pyo.Set(initialize=M)
+    m.H = pyo.Set(initialize=H)
+    m.Hsoc = pyo.Set(initialize=Hsoc)
+    m.A = pyo.Set(dimen=4, initialize=A)
+    m.ORIGIN_ST = pyo.Set(dimen=3, initialize=data["ORIGIN_ST"])
+    m.DEST_ST = pyo.Set(dimen=3, initialize=data["DEST_ST"])
+    m.D = pyo.Set(within=m.I * m.I, initialize=data["allowed"])
+    m.C_pub = pyo.Set(initialize=C)
+    m.B = pyo.Set(initialize=B)
 
-
-def _safe_value(obj, default: float = 0.0) -> float:
-    try:
-        v = value(obj, exception=False)
-        return default if v is None else float(v)
-    except Exception:
-        return default
-
-
-def build_master_model(data: dict, cfg: dict, scenario: str):
-    """LBBD master: charger infrastructure + PV + BESS operation + local service
-    + redirection interface. Redirection remains decomposed by month-time slot.
-
-    BESS is kept in the master to preserve the 12-month linked representative-day SoC
-    structure. The redirection subproblem remains a slot-wise type-aware recourse model.
-    Redirected energy is conservatively costed as grid-supplied in the redirection
-    subproblem; local non-redirected charging can use grid, direct PV, and BESS discharge.
-    """
-    if scenario not in {"with_redirection", "no_redirection"}:
-        raise ValueError(f"Unsupported scenario: {scenario}")
-
-    m = ConcreteModel()
-    I = data["hex_ids"]
-    M = data["MONTHS"]
-    H = data["INTERVALS"]
-    Hsoc = data["HSOC"]
-    C = data["PUB_TYPES"]
-    B = data["DEMAND_CLASSES"]
-
-    m.I = Set(initialize=I)
-    m.M = Set(initialize=M)
-    m.H = Set(initialize=H)
-    m.Hsoc = Set(initialize=Hsoc)
-    m.C_pub = Set(initialize=C)
-    m.B = Set(initialize=B)
-
-    m.Price = Param(m.C_pub, initialize=data["charger_price"])
-    m.Demand = Param(m.I, m.M, m.H, m.B, initialize=data["demand_event_annual"], within=NonNegativeReals)
-    m.K = Param(m.C_pub, initialize=data["charger_capacity_pub"])
-    m.Footprint = Param(m.C_pub, initialize=data["charger_footprint"])
-    m.PVF_cost = Param(m.C_pub, initialize=lambda mm, c: data["daily_cost"][c])
-    m.PVF_PV = Param(initialize=data["daily_cost"]["PV"])
-    m.PVF_Batt = Param(initialize=data["daily_cost"]["Batt"])
-    m.CL = Param(m.I, initialize=data["cl"])
-    m.tou = Param(m.M, m.H, initialize=lambda mm, mon, t: data["tou"][mon][t], mutable=False)
-    m.Ndays = Param(m.M, initialize=lambda mm, mon: data["N_MONTH"][mon])
-    m.PV_panel_cap = Param(initialize=data["pv_kwh_per_panel_slot_at_cf1"])
-    m.p_pv = Param(m.M, m.H, initialize=lambda mm, mon, t: data["pv_cf"][mon][t], mutable=False)
-    m.PV_upper = Param(m.I, initialize=data["pv_upper"])
-
-    m.Batt_cell_cap = Param(initialize=float(cfg["battery_cell_cap_kwh"]))
-    m.eta_ch = Param(initialize=float(cfg["eta_charge"]))
-    m.eta_dis = Param(initialize=float(cfg["eta_discharge"]))
-    m.alpha_soc = Param(initialize=float(cfg["initial_soc_fraction"]))
-    m.beta_min_soc = Param(initialize=float(cfg["soc_min_fraction"]))
-    m.beta_max_soc = Param(initialize=float(cfg["soc_max_fraction"]))
-    m.K_batt = Param(initialize=data["K_BATT"])
-    m.M_batt = Param(m.I, initialize=lambda mm, i: data["M_BATT"][int(i)], within=NonNegativeReals)
-    m.prev_mon = Param(m.M, initialize=data["prev_month"], within=Any)
-
-    theta_ub = compute_theta_upper_bounds(data, cfg)
+    m.Price = pyo.Param(m.C_pub, initialize=data["charger_price"])
+    m.DeltaPrice = pyo.Param(m.C_pub, m.C_pub, initialize=data["delta_price"], within=pyo.NonNegativeReals)
+    m.Demand = pyo.Param(m.I, m.M, m.H, m.B, initialize=data["demand_event_annual"], within=pyo.NonNegativeReals)
+    m.K = pyo.Param(m.C_pub, initialize=data["charger_capacity_pub"])
+    m.Footprint = pyo.Param(m.C_pub, initialize=data["charger_footprint"])
+    m.PVF_cost = pyo.Param(m.C_pub, initialize=lambda mm, c: data["daily_cost"][c])
+    m.PVF_PV = pyo.Param(initialize=data["daily_cost"]["PV"])
+    m.PVF_Batt = pyo.Param(initialize=data["daily_cost"]["Batt"])
+    m.CL = pyo.Param(m.I, initialize=data["cl"])
+    m.T = pyo.Param(m.D, initialize=data["T_dict"])
+    m.tou = pyo.Param(m.M, m.H, initialize=lambda mm, mon, t: data["tou"][mon][t])
+    m.PV_panel_cap = pyo.Param(initialize=data["pv_kwh_per_panel_slot_at_cf1"])
+    m.p_pv = pyo.Param(m.M, m.H, initialize=lambda mm, mon, t: data["pv_cf"][mon][t])
+    m.PV_upper = pyo.Param(m.I, initialize=data["pv_upper"])
+    m.x_kWh = pyo.Param(initialize=float(cfg["x_kwh_per_trip"]))
+    m.Batt_cell_cap = pyo.Param(initialize=float(cfg["battery_cell_cap_kwh"]))
+    m.eta_ch = pyo.Param(initialize=float(cfg["eta_charge"]))
+    m.eta_dis = pyo.Param(initialize=float(cfg["eta_discharge"]))
+    m.alpha_soc = pyo.Param(initialize=float(cfg["initial_soc_fraction"]))
+    m.beta_min_soc = pyo.Param(initialize=float(cfg["soc_min_fraction"]))
+    m.beta_max_soc = pyo.Param(initialize=float(cfg["soc_max_fraction"]))
+    m.K_batt = pyo.Param(initialize=data["K_BATT"])
+    m.M_batt = pyo.Param(m.I, initialize=lambda mm, i: data["M_BATT"][int(i)], within=pyo.NonNegativeReals)
+    m.M_redir = pyo.Param(m.I, initialize=lambda mm, j: data["M_REDIR"][int(j)], within=pyo.NonNegativeReals)
+    m.prev_mon = pyo.Param(m.M, initialize=data["prev_month"], within=pyo.Any)
+    m.Ndays = pyo.Param(m.M, initialize=lambda mm, mon: data["N_MONTH"][mon])
 
     def x_bounds(mm, i, c):
-        return (0, int(math.floor(float(data["cl"][int(i)]) / float(data["charger_footprint"][c]))))
-
+        return (0, int(math.floor(data["cl"][int(i)] / data["charger_footprint"][c])))
     def pv_bounds(mm, i):
-        return (0, int(math.floor(float(data["pv_upper"].get(int(i), 0)))))
-
+        return (0, data["pv_upper"][int(i)])
     def batt_bounds(mm, i):
         return (0, int(cfg["battery_max_units_per_hex"]))
 
-    def theta_bounds(mm, mon, t):
-        return (0.0, theta_ub[(mon, int(t))])
+    m.x = pyo.Var(m.I, m.C_pub, domain=pyo.NonNegativeIntegers, bounds=x_bounds)
+    m.PV = pyo.Var(m.I, domain=pyo.NonNegativeIntegers, bounds=pv_bounds)
+    m.Batt = pyo.Var(m.I, domain=pyo.NonNegativeIntegers, bounds=batt_bounds)
+    m.edisp = pyo.Var(m.I, m.M, m.H, m.C_pub, m.B, domain=pyo.NonNegativeReals)
+    m.grid_dir = pyo.Var(m.I, m.M, m.H, domain=pyo.NonNegativeReals)
+    m.grid_batt = pyo.Var(m.I, m.M, m.H, domain=pyo.NonNegativeReals)
+    m.pv_dir = pyo.Var(m.I, m.M, m.H, domain=pyo.NonNegativeReals)
+    m.pv_batt = pyo.Var(m.I, m.M, m.H, domain=pyo.NonNegativeReals)
+    m.batt_discharge = pyo.Var(m.I, m.M, m.H, domain=pyo.NonNegativeReals)
+    m.soc = pyo.Var(m.I, m.M, m.Hsoc, domain=pyo.NonNegativeReals)
+    m.delta = pyo.Var(m.I, m.M, m.H, domain=pyo.Binary)
+    m.slack = pyo.Var(m.I, m.M, m.H, m.B, domain=pyo.NonNegativeReals)
+    m.q = pyo.Var(m.I, m.M, m.H, m.C_pub, domain=pyo.NonNegativeReals)
+    m.R = pyo.Var(m.I, m.M, m.H, m.C_pub, domain=pyo.NonNegativeReals)
+    m.W = pyo.Var(m.I, m.M, m.H, m.C_pub, domain=pyo.NonNegativeReals)
+    m.G = pyo.Var(m.A, domain=pyo.NonNegativeReals)
+    m.Yarc = pyo.Var(m.A, domain=pyo.Binary)
+    m.n_trip = pyo.Var(m.A, domain=pyo.NonNegativeIntegers)
+    m.r_tail = pyo.Var(m.A, domain=pyo.NonNegativeReals)
+    m.ThetaType = pyo.Var(m.M, m.H, domain=pyo.NonNegativeReals)
+    m.TypeAssignmentCuts = pyo.ConstraintList()
 
-    m.x = Var(m.I, m.C_pub, domain=NonNegativeIntegers, bounds=x_bounds)
-    m.PV = Var(m.I, domain=NonNegativeIntegers, bounds=pv_bounds)
-    m.Batt = Var(m.I, domain=NonNegativeIntegers, bounds=batt_bounds)
-    m.e_home = Var(m.I, m.M, m.H, m.C_pub, domain=NonNegativeReals)
-    m.q = Var(m.I, m.M, m.H, m.C_pub, domain=NonNegativeReals)
-    m.R = Var(m.I, m.M, m.H, m.C_pub, domain=NonNegativeReals)
-    m.S = Var(m.I, m.M, m.H, m.C_pub, domain=NonNegativeReals)
-    m.grid_dir = Var(m.I, m.M, m.H, domain=NonNegativeReals)
-    m.grid_batt = Var(m.I, m.M, m.H, domain=NonNegativeReals)
-    m.pv_dir = Var(m.I, m.M, m.H, domain=NonNegativeReals)
-    m.pv_batt = Var(m.I, m.M, m.H, domain=NonNegativeReals)
-    m.batt_discharge = Var(m.I, m.M, m.H, domain=NonNegativeReals)
-    m.soc = Var(m.I, m.M, m.Hsoc, domain=NonNegativeReals)
-    m.delta = Var(m.I, m.M, m.H, domain=Binary)
-    m.slack = Var(m.I, m.M, m.H, m.B, domain=NonNegativeReals)
-    m.ThetaRedir = Var(m.M, m.H, domain=NonNegativeReals, bounds=theta_bounds)
-    m.BendersCuts = ConstraintList()
+    OUT, IN = data["OUT"], data["IN"]
+    eligible = data["eligible"]
+    redir_min = float(cfg["redir_min_kwh"])
 
-    def public_limit(mm, i):
-        return quicksum(mm.Footprint[c] * mm.x[i, c] for c in mm.C_pub) <= mm.CL[i]
+    m.SiteUtil = pyo.Constraint(m.I, m.M, m.H, m.C_pub, rule=lambda mm, i, mon, t, c: pyo.quicksum(mm.edisp[i, mon, t, c, b] for b in mm.B) <= mm.K[c] * mm.x[i, c])
+    m.PublicLimit = pyo.Constraint(m.I, rule=lambda mm, i: pyo.quicksum(mm.Footprint[c] * mm.x[i, c] for c in mm.C_pub) <= mm.CL[i])
 
-    m.PublicLimit = Constraint(m.I, rule=public_limit)
+    def demand_cover(mm, i, mon, t, b):
+        served = pyo.quicksum(mm.edisp[i, mon, t, c, b] for c in eligible[b])
+        if b == "home":
+            return served + mm.slack[i, mon, t, b] == mm.Demand[i, mon, t, "home"]
+        return served + mm.slack[i, mon, t, b] == mm.Demand[i, mon, t, "public"] - pyo.quicksum(mm.R[i, mon, t, c] for c in mm.C_pub) + pyo.quicksum(mm.W[i, mon, t, c] for c in mm.C_pub)
+    m.DemandCover = pyo.Constraint(m.I, m.M, m.H, m.B, rule=demand_cover)
 
-    def pv_upper_bound(mm, i):
-        return mm.PV[i] <= mm.PV_upper[i]
+    m.OriginTypeAllocation = pyo.Constraint(m.I, m.M, m.H, rule=lambda mm, i, mon, t: pyo.quicksum(mm.q[i, mon, t, c] for c in mm.C_pub) + mm.slack[i, mon, t, "public"] == mm.Demand[i, mon, t, "public"])
+    m.OriginTypeConsistency = pyo.Constraint(m.I, m.M, m.H, m.C_pub, rule=lambda mm, i, mon, t, c: mm.q[i, mon, t, c] == mm.edisp[i, mon, t, c, "public"] - mm.W[i, mon, t, c] + mm.R[i, mon, t, c])
+    m.OutgoingByOriginType = pyo.Constraint(m.I, m.M, m.H, m.C_pub, rule=lambda mm, i, mon, t, c: mm.R[i, mon, t, c] <= mm.q[i, mon, t, c])
+    m.IncomingServedByDestType = pyo.Constraint(m.I, m.M, m.H, m.C_pub, rule=lambda mm, i, mon, t, c: mm.W[i, mon, t, c] <= mm.edisp[i, mon, t, c, "public"])
+    m.DestIncomingTypeCapacity = pyo.Constraint(m.I, m.M, m.H, m.C_pub, rule=lambda mm, i, mon, t, c: mm.W[i, mon, t, c] <= mm.K[c] * mm.x[i, c])
+    m.OriginOutflowBound = pyo.Constraint(m.I, m.M, m.H, rule=lambda mm, i, mon, t: pyo.quicksum(mm.R[i, mon, t, c] for c in mm.C_pub) <= mm.Demand[i, mon, t, "public"])
 
-    m.PVUpperBound = Constraint(m.I, rule=pv_upper_bound)
+    def out_flow(mm, i, mon, t):
+        outs = OUT.get((int(i), mon, int(t)), [])
+        if not outs:
+            return pyo.quicksum(mm.R[i, mon, t, c] for c in mm.C_pub) == 0
+        return pyo.quicksum(mm.G[i, int(j), mon, t] for j in outs) == pyo.quicksum(mm.R[i, mon, t, c] for c in mm.C_pub)
+    m.AggregateOutflowWitness = pyo.Constraint(m.I, m.M, m.H, rule=out_flow)
 
-    def batt_cap_rule(mm, i):
-        return mm.Batt[i] <= int(cfg["battery_max_units_per_hex"])
+    def in_flow(mm, j, mon, t):
+        ins = IN.get((int(j), mon, int(t)), [])
+        if not ins:
+            return pyo.quicksum(mm.W[j, mon, t, c] for c in mm.C_pub) == 0
+        return pyo.quicksum(mm.G[int(i), j, mon, t] for i in ins) == pyo.quicksum(mm.W[j, mon, t, c] for c in mm.C_pub)
+    m.AggregateInflowWitness = pyo.Constraint(m.I, m.M, m.H, rule=in_flow)
 
-    m.BattCap = Constraint(m.I, rule=batt_cap_rule)
+    m.RedirMin = pyo.Constraint(m.A, rule=lambda mm, i, j, mon, t: mm.G[i, j, mon, t] >= redir_min * mm.Yarc[i, j, mon, t])
+    m.RedirCapInstall = pyo.Constraint(m.A, rule=lambda mm, i, j, mon, t: mm.G[i, j, mon, t] <= pyo.quicksum(mm.K[c] * mm.x[j, c] for c in mm.C_pub))
+    m.RedirCapBinary = pyo.Constraint(m.A, rule=lambda mm, i, j, mon, t: mm.G[i, j, mon, t] <= mm.M_redir[j] * mm.Yarc[i, j, mon, t])
+    m.TripDecomp = pyo.Constraint(m.A, rule=lambda mm, i, j, mon, t: mm.G[i, j, mon, t] == mm.x_kWh * mm.n_trip[i, j, mon, t] + mm.r_tail[i, j, mon, t])
+    m.TailUpper = pyo.Constraint(m.A, rule=lambda mm, i, j, mon, t: mm.r_tail[i, j, mon, t] <= (mm.x_kWh - 1e-6) * mm.Yarc[i, j, mon, t])
 
-    def home_cover(mm, i, mon, t):
-        return quicksum(mm.e_home[i, mon, t, c] for c in mm.C_pub) + mm.slack[i, mon, t, "home"] == mm.Demand[i, mon, t, "home"]
-
-    m.HomeDemandCover = Constraint(m.I, m.M, m.H, rule=home_cover)
-
-    def public_origin_allocation(mm, i, mon, t):
-        return quicksum(mm.q[i, mon, t, c] for c in mm.C_pub) + mm.slack[i, mon, t, "public"] == mm.Demand[i, mon, t, "public"]
-
-    m.PublicOriginAllocation = Constraint(m.I, m.M, m.H, rule=public_origin_allocation)
-
-    def redirectable_bound(mm, i, mon, t, c):
-        return mm.R[i, mon, t, c] <= mm.q[i, mon, t, c]
-
-    m.RedirectableBound = Constraint(m.I, m.M, m.H, m.C_pub, rule=redirectable_bound)
-
-    def type_capacity_interface(mm, i, mon, t, c):
-        local_public = mm.q[i, mon, t, c] - mm.R[i, mon, t, c]
-        return mm.e_home[i, mon, t, c] + local_public + mm.S[i, mon, t, c] <= mm.K[c] * mm.x[i, c]
-
-    m.TypeCapacityInterface = Constraint(m.I, m.M, m.H, m.C_pub, rule=type_capacity_interface)
-
-    def energy_balance(mm, i, mon, t):
-        local_energy = quicksum(mm.e_home[i, mon, t, c] + mm.q[i, mon, t, c] - mm.R[i, mon, t, c] for c in mm.C_pub)
-        return mm.grid_dir[i, mon, t] + mm.pv_dir[i, mon, t] + mm.batt_discharge[i, mon, t] == local_energy
-
-    m.EnergyBalance = Constraint(m.I, m.M, m.H, rule=energy_balance)
-
-    def pv_generation(mm, i, mon, t):
-        return mm.pv_dir[i, mon, t] + mm.pv_batt[i, mon, t] <= mm.PV_panel_cap * mm.PV[i] * mm.p_pv[mon, t]
-
-    m.PVGeneration = Constraint(m.I, m.M, m.H, rule=pv_generation)
+    m.EnergyBalance = pyo.Constraint(m.I, m.M, m.H, rule=lambda mm, i, mon, t: mm.grid_dir[i, mon, t] + mm.pv_dir[i, mon, t] + mm.batt_discharge[i, mon, t] == pyo.quicksum(mm.edisp[i, mon, t, c, b] for c in mm.C_pub for b in mm.B))
+    m.PVGeneration = pyo.Constraint(m.I, m.M, m.H, rule=lambda mm, i, mon, t: mm.pv_dir[i, mon, t] + mm.pv_batt[i, mon, t] <= mm.PV_panel_cap * mm.PV[i] * mm.p_pv[mon, t])
 
     last_h = max(data["INTERVALS"])
-
-    def battery_initial_january(mm, i):
-        return mm.soc[i, "January", 0] == mm.alpha_soc * mm.Batt_cell_cap * mm.Batt[i]
-
-    m.BatteryInitialJanuary = Constraint(m.I, rule=battery_initial_january)
-
-    def battery_month_link(mm, i, mon):
+    m.BatteryInitialJanuary = pyo.Constraint(m.I, rule=lambda mm, i: mm.soc[i, "January", 0] == mm.alpha_soc * mm.Batt_cell_cap * mm.Batt[i])
+    def month_link(mm, i, mon):
         if mon == "January":
-            return Constraint.Skip
+            return pyo.Constraint.Skip
         return mm.soc[i, mon, 0] == mm.soc[i, mm.prev_mon[mon], last_h]
-
-    m.BatteryMonthLink = Constraint(m.I, m.M, rule=battery_month_link)
-
-    def battery_dynamics(mm, i, mon, t):
-        charge = mm.eta_ch * (mm.grid_batt[i, mon, t] + mm.pv_batt[i, mon, t])
-        discharge = (1.0 / mm.eta_dis) * mm.batt_discharge[i, mon, t]
-        return mm.soc[i, mon, t] == mm.soc[i, mon, t - 1] + charge - discharge
-
-    m.BatteryDynamics = Constraint(m.I, m.M, m.H, rule=battery_dynamics)
-
-    def batt_charge_throughput(mm, i, mon, t):
-        return mm.grid_batt[i, mon, t] + mm.pv_batt[i, mon, t] <= mm.K_batt * mm.Batt[i]
-
-    m.BattChargeThroughput = Constraint(m.I, m.M, m.H, rule=batt_charge_throughput)
-
-    def batt_discharge_throughput(mm, i, mon, t):
-        return mm.batt_discharge[i, mon, t] <= mm.K_batt * mm.Batt[i]
-
-    m.BattDischargeThroughput = Constraint(m.I, m.M, m.H, rule=batt_discharge_throughput)
-
-    def charge_only(mm, i, mon, t):
-        return mm.grid_batt[i, mon, t] + mm.pv_batt[i, mon, t] <= mm.M_batt[i] * mm.delta[i, mon, t]
-
-    m.ChargeOnly = Constraint(m.I, m.M, m.H, rule=charge_only)
-
-    def discharge_only(mm, i, mon, t):
-        return mm.batt_discharge[i, mon, t] <= mm.M_batt[i] * (1 - mm.delta[i, mon, t])
-
-    m.DischargeOnly = Constraint(m.I, m.M, m.H, rule=discharge_only)
-
-    def battery_capacity_upper(mm, i, mon, ell):
-        return mm.soc[i, mon, ell] <= mm.beta_max_soc * mm.Batt_cell_cap * mm.Batt[i]
-
-    m.BatteryCapacityUpper = Constraint(m.I, m.M, m.Hsoc, rule=battery_capacity_upper)
-
-    def battery_capacity_lower(mm, i, mon, ell):
-        return mm.soc[i, mon, ell] >= mm.beta_min_soc * mm.Batt_cell_cap * mm.Batt[i]
-
-    m.BatteryCapacityLower = Constraint(m.I, m.M, m.Hsoc, rule=battery_capacity_lower)
+    m.BatteryMonthLink = pyo.Constraint(m.I, m.M, rule=month_link)
+    m.BatteryDynamics = pyo.Constraint(m.I, m.M, m.H, rule=lambda mm, i, mon, t: mm.soc[i, mon, t] == mm.soc[i, mon, t - 1] + mm.eta_ch * (mm.grid_batt[i, mon, t] + mm.pv_batt[i, mon, t]) - (1.0 / mm.eta_dis) * mm.batt_discharge[i, mon, t])
+    m.BattCap = pyo.Constraint(m.I, rule=lambda mm, i: mm.Batt[i] <= int(cfg["battery_max_units_per_hex"]))
+    m.PVUpperBound = pyo.Constraint(m.I, rule=lambda mm, i: mm.PV[i] <= mm.PV_upper[i])
+    m.BattChargeThroughput = pyo.Constraint(m.I, m.M, m.H, rule=lambda mm, i, mon, t: mm.grid_batt[i, mon, t] + mm.pv_batt[i, mon, t] <= mm.K_batt * mm.Batt[i])
+    m.BattDischargeThroughput = pyo.Constraint(m.I, m.M, m.H, rule=lambda mm, i, mon, t: mm.batt_discharge[i, mon, t] <= mm.K_batt * mm.Batt[i])
+    m.ChargeOnly = pyo.Constraint(m.I, m.M, m.H, rule=lambda mm, i, mon, t: mm.grid_batt[i, mon, t] + mm.pv_batt[i, mon, t] <= mm.M_batt[i] * mm.delta[i, mon, t])
+    m.DischargeOnly = pyo.Constraint(m.I, m.M, m.H, rule=lambda mm, i, mon, t: mm.batt_discharge[i, mon, t] <= mm.M_batt[i] * (1 - mm.delta[i, mon, t]))
+    m.BatteryCapacityUpper = pyo.Constraint(m.I, m.M, m.Hsoc, rule=lambda mm, i, mon, ell: mm.soc[i, mon, ell] <= mm.beta_max_soc * mm.Batt_cell_cap * mm.Batt[i])
+    m.BatteryCapacityLower = pyo.Constraint(m.I, m.M, m.Hsoc, rule=lambda mm, i, mon, ell: mm.soc[i, mon, ell] >= mm.beta_min_soc * mm.Batt_cell_cap * mm.Batt[i])
 
     if data.get("disable_pv", False):
-        for idx in m.PV:
-            m.PV[idx].fix(0)
-        for idx in m.pv_dir:
-            m.pv_dir[idx].fix(0.0)
-        for idx in m.pv_batt:
-            m.pv_batt[idx].fix(0.0)
-
+        for idx in m.PV: m.PV[idx].fix(0)
+        for comp in (m.pv_dir, m.pv_batt):
+            for idx in comp: comp[idx].fix(0)
     if data.get("disable_bess", False):
-        for idx in m.Batt:
-            m.Batt[idx].fix(0)
-        for idx in m.grid_batt:
-            m.grid_batt[idx].fix(0.0)
-        for idx in m.pv_batt:
-            m.pv_batt[idx].fix(0.0)
-        for idx in m.batt_discharge:
-            m.batt_discharge[idx].fix(0.0)
-        for idx in m.soc:
-            m.soc[idx].fix(0.0)
-        for idx in m.delta:
-            m.delta[idx].fix(0)
+        for idx in m.Batt: m.Batt[idx].fix(0)
+        for comp in (m.grid_batt, m.pv_batt, m.batt_discharge, m.soc, m.delta):
+            for idx in comp: comp[idx].fix(0)
 
     if scenario == "no_redirection":
-        for idx in m.R:
-            m.R[idx].fix(0.0)
-        for idx in m.S:
-            m.S[idx].fix(0.0)
-        for idx in m.ThetaRedir:
-            m.ThetaRedir[idx].fix(0.0)
+        for comp in (m.R, m.W, m.G, m.Yarc, m.n_trip, m.r_tail, m.ThetaType):
+            for idx in comp: comp[idx].fix(0)
+    elif scenario == "with_redirection":
+        pass
 
     days = data["DAYS"]
     penalty = float(cfg["penalty_per_kwh_slack"])
-
     def annual_profit(mm):
-        local_revenue = quicksum(
-            mm.Ndays[mon] * mm.Price[c] * (mm.e_home[i, mon, t, c] + mm.q[i, mon, t, c] - mm.R[i, mon, t, c])
-            for i in mm.I for mon in mm.M for t in mm.H for c in mm.C_pub
-        )
-        grid_cost = quicksum(
-            mm.Ndays[mon] * mm.tou[mon, t] * (mm.grid_dir[i, mon, t] + mm.grid_batt[i, mon, t])
-            for i in mm.I for mon in mm.M for t in mm.H
-        )
-        slack_cost = penalty * quicksum(
-            mm.Ndays[mon] * mm.slack[i, mon, t, b]
-            for i in mm.I for mon in mm.M for t in mm.H for b in mm.B
-        )
-        capex_chargers = days * quicksum(mm.PVF_cost[c] * mm.x[i, c] for i in mm.I for c in mm.C_pub)
-        capex_pv = days * quicksum(mm.PVF_PV * mm.PV[i] for i in mm.I)
-        capex_batt = days * quicksum(mm.PVF_Batt * mm.Batt[i] for i in mm.I)
-        redirection_proxy = quicksum(mm.ThetaRedir[mon, t] for mon in mm.M for t in mm.H)
-        return local_revenue - grid_cost - slack_cost - capex_chargers - capex_pv - capex_batt + redirection_proxy
-
-    m.obj = Objective(rule=annual_profit, sense=maximize)
-    m._lbbd_data = data
-    m._lbbd_cfg = cfg
-    m._theta_ub = theta_ub
+        rev = pyo.quicksum(mm.Ndays[mon] * mm.Price[c] * mm.edisp[i, mon, t, c, b] for i in mm.I for mon in mm.M for t in mm.H for b in mm.B for c in mm.C_pub)
+        grid = pyo.quicksum(mm.Ndays[mon] * mm.tou[mon, t] * (mm.grid_dir[i, mon, t] + mm.grid_batt[i, mon, t]) for i in mm.I for mon in mm.M for t in mm.H)
+        dist = pyo.quicksum(mm.Ndays[mon] * (mm.T[i, j] * mm.n_trip[i, j, mon, t] + (mm.T[i, j] / mm.x_kWh) * mm.r_tail[i, j, mon, t]) for (i, j, mon, t) in mm.A)
+        theta = pyo.quicksum(mm.ThetaType[mon, t] for mon in mm.M for t in mm.H)
+        slack = penalty * pyo.quicksum(mm.Ndays[mon] * mm.slack[i, mon, t, b] for i in mm.I for mon in mm.M for t in mm.H for b in mm.B)
+        capex = days * (pyo.quicksum(mm.PVF_cost[c] * mm.x[i, c] for i in mm.I for c in mm.C_pub) + pyo.quicksum(mm.PVF_PV * mm.PV[i] for i in mm.I) + pyo.quicksum(mm.PVF_Batt * mm.Batt[i] for i in mm.I))
+        return rev - grid - dist - theta - slack - capex
+    m.obj = pyo.Objective(rule=annual_profit, sense=pyo.maximize)
     return m
 
 
-def extract_interface(model) -> dict[str, dict]:
-    R: dict[tuple[int, str, int, str], float] = {}
-    S: dict[tuple[int, str, int, str], float] = {}
-    theta: dict[tuple[str, int], float] = {}
-    for i in model.I:
-        for mon in model.M:
-            for t in model.H:
-                for c in model.C_pub:
-                    R[(int(i), str(mon), int(t), str(c))] = max(0.0, _safe_value(model.R[i, mon, t, c]))
-                    S[(int(i), str(mon), int(t), str(c))] = max(0.0, _safe_value(model.S[i, mon, t, c]))
-    for mon in model.M:
-        for t in model.H:
-            theta[(str(mon), int(t))] = max(0.0, _safe_value(model.ThetaRedir[mon, t]))
-    return {"R": R, "S": S, "theta": theta}
-
-
-def evaluate_base_objective(model) -> float:
-    theta_total = sum(_safe_value(model.ThetaRedir[mon, t]) for mon in model.M for t in model.H)
-    return _safe_value(model.obj) - theta_total
-
-
-def add_dual_cut(model, mon: str, t: int, alpha: dict[tuple[int, str], float], beta: dict[tuple[int, str], float]) -> int:
-    expr = 0.0
-    nz = 0
-    for (i, co), val in alpha.items():
-        if abs(val) > 1e-9:
-            expr += float(val) * model.R[int(i), mon, int(t), str(co)]
-            nz += 1
-    for (j, cd), val in beta.items():
-        if abs(val) > 1e-9:
-            expr += float(val) * model.S[int(j), mon, int(t), str(cd)]
-            nz += 1
-    model.BendersCuts.add(model.ThetaRedir[mon, int(t)] <= expr)
-    return nz
+def apply_hard_no_slack(model):
+    for idx in model.slack:
+        model.slack[idx].fix(0)

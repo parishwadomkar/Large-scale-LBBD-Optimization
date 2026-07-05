@@ -1,8 +1,0 @@
-check,passed,value,threshold,note
-lbbd_gap_within_target,True,0.016442027709798853,0.025,percent
-slack_penalty_effectively_zero,True,0.0,<= 1e-3 SEK,
-soc_month_link_gap_within_numerical_tolerance,True,0.0,<= 1 kWh,"adaptive tolerance: max(1 kWh, 0.01% of installed BESS energy capacity)"
-annual_profit_present,True,498551746.682475,numeric,
-pv_panels_present,True,65467.0,numeric,
-battery_units_present,True,0.0,numeric,
-disabled_bess_is_zero,True,"Batt=0.0, grid_to_batt=0.0, pv_to_batt=0.0, batt_discharge=0.0",Batt <= 1e-5 and all BESS energy flows <= 1e-3 kWh,required because --disable-bess was passed
