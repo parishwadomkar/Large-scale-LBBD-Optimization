@@ -1,12 +1,15 @@
 # Large-Scale EV Charging Infrastructure Optimization
 
-## PV- and BESS-enabled public EV charging with user redirection
+## PV and BESS-enabled public EV charging with user redirection
 
-This repository implements a Pyomo/Gurobi optimization framework for planning public EV charging infrastructure with co-located photovoltaic (PV) generation, battery energy storage systems (BESS), and incentive-based short-range user redirection. The model is designed from the perspective of a charging point operator (CPO) and maximizes annual net profit while satisfying spatiotemporal charging demand.
+This repository implements a Pyomo/Gurobi optimization framework for planning public electric-vehicle (EV) charging infrastructure with co-located photovoltaic (PV) generation, battery energy storage systems (BESS), and incentive-based short-range user redirection. The model is formulated from the perspective of a charging point operator (CPO) and maximizes annual net profit while satisfying spatiotemporal charging demand.
 
-The full-scale type-aware redirection problem is solved with a **Logic-Based Benders Decomposition (LBBD)** workflow. A monolithic formulation is also retained for small-scale validation and benchmark comparisons.
+The repository contains two maintained optimization workflows:
 
-Charging demand is generated externally using the MATSim-based simulation framework [`UrbanEV-v2`](https://github.com/parishwadomkar/UrbanEV-v2) and aggregated to spatial planning cells, representative monthly days, and half-hour intervals.
+1. a monolithic MILP used for benchmark validation and scenario checks; and
+2. a Logic-Based Benders Decomposition (LBBD) implementation for large-scale runs.
+
+Charging demand is generated externally using the MATSim-based simulation framework [`UrbanEV-v2`](https://github.com/parishwadomkar/UrbanEV-v2) and aggregated to spatial planning cells, representative month-days, and half-hour intervals.
 
 <p align="center">
   <img src="./assets/Considerations.png" alt="Integrated EV charging, PV, BESS, and redirection planning scope" width="85%">
@@ -20,15 +23,16 @@ Charging demand is generated externally using the MATSim-based simulation framew
 
 The framework jointly represents:
 
-- public charger deployment by charger type;
-- PV and BESS sizing at candidate spatial cells;
-- grid procurement, PV self-consumption, BESS charging/discharging, and linked monthly SoC dynamics;
-- residual home demand served locally by public chargers;
-- type-aware public charging redirection across eligible short-distance cell pairs;
-- redirection incentive costs and tariff-compensation accounting;
-- annualized charger, PV, and BESS investment costs.
+- public charger deployment by charger type
+- PV and BESS sizing at candidate spatial cells
+- grid procurement, PV self-consumption, BESS charging/discharging, and linked monthly SoC dynamics
+- residual home demand served locally by public chargers
+- type-aware public charging redirection across eligible short-distance cell pairs
+- redirection distance incentives and charger-type tariff-compensation accounting
+- annualized charger, PV, and BESS investment costs
+- unmet-demand slack variables for diagnostic feasibility.
 
-The model is intended for strategic city-scale planning. It does not model private home-charger investment, upstream grid reinforcement, parcel-level permitting, or real-time user acceptance behavior.
+The model is intended for strategic city-scale planning. It does not model private home-charger investment, upstream grid reinforcement, parcel-level permitting, or real-time heterogeneous user acceptance behavior.
 
 <p align="center">
   <img src="./assets/LBBD.png" alt="Logic-Based Benders Decomposition workflow" width="70%">
@@ -38,22 +42,46 @@ The model is intended for strategic city-scale planning. It does not model priva
 
 ---
 
-## Implemented workflows
+## Repository structure and LBBD design
 
-| Workflow | Location | Intended use |
+```text
+Opti/
+├── config/                  # paths, model parameters, and Gurobi settings
+├── data/raw/                # small and full input datasets
+├── scripts/                 # monolithic run scripts
+├── scripts_lbbd/            # LBBD run scripts
+├── src/                     # monolithic Pyomo/Gurobi formulation
+├── src_lbbd/                # monolithic-comparable LBBD implementation
+└── runs/                    # generated run folders and outputs
+```
+
+The LBBD master problem retains the investment and temporally coupled energy system decisions:
+
+- charger deployment
+- PV deployment
+- BESS deployment
+- local public/home service
+- grid/PV/BESS dispatch
+- linked representative-month SoC dynamics
+- outgoing redirected energy by origin charger type
+- incoming redirected energy by destination charger type
+- aggregate physical redirection arc flow
+- aggregate trip-bundle and distance-incentive costs.
+
+The type-pair redirection tensor is not placed in the master. Instead, slot-wise type-assignment LP subproblems reconstruct origin/destination charger-type redirection flows conditional on the master solution and return Benders optimality cuts for the residual tariff-compensation recourse term.
+
+This decomposition preserves the monolithic energy-system coupling: incoming redirected demand is included in destination-side service, charger-type capacity, revenue, grid/PV/BESS dispatch, and SoC logic.
+
+### Cut strategies
+
+| Strategy | Description | Recommended use |
 |---|---|---|
-| Monolithic MILP | `src/` | Full/Small-instance validation, scenario checks, and comparison against LBBD outputs. |
-| LBBD | `src_lbbd/` | Full/small-scale optimization with type-aware redirection. Recommended for city-scale runs. |
+| `standard` | Standard slot-wise LP-dual Benders cuts. | Validated baseline and recommended first full-data run. |
+| `corepoint` | Core-point / Pareto-style auxiliary dual cut selection. | Diagnostic option; may produce stronger cuts but can be slower. |
+| `mw` | Compatibility alias for Magnanti-Wong-style cut selection. | Legacy/diagnostic experiments. |
+| `pareto` | Compatibility alias for Pareto-style cut selection. | Legacy/diagnostic experiments. |
 
-In the LBBD workflow, charger, PV, BESS, local energy dispatch, and SoC-linking constraints are retained in the master problem. Redirection is evaluated through slot-wise LP/MIP recourse models, and violated Benders cuts are added iteratively.
-
-Available cut strategies are:
-
-| Strategy | Description | Typical use |
-|---|---|---|
-| `standard` | Standard slot-wise LP-dual cuts. | Baseline and debugging. |
-| `corepoint` | Core-point / Pareto-style dual cut selection. | Recommended for full-scale runs. |
-| `mw`, `pareto` | Compatibility aliases mapped to the core-point strategy. | Legacy experiment names. |
+Use `standard` unless a small-data diagnostic shows that an advanced cut strategy improves runtime and certified bounds for the current dataset and solver settings.
 
 ---
 
@@ -101,30 +129,56 @@ python -c "import pyomo.environ as pyo; print(pyo.SolverFactory('gurobi').availa
 
 Run all commands from the project root.
 
-Small LBBD validation:
+### Small dataset validation
+
+Full-data-realistic tolerance:
 
 ```powershell
-python src_lbbd\run_lbbd.py --dataset small --scenario with_redirection --preset small_validation --threads 10 --cut-strategy corepoint --mip-reconstruction-frequency 2
+python src_lbbd\run_lbbd.py --dataset small --scenario with_redirection --threads 8 --master-gap 0.0005 --subproblem-gap 0.0001 --lbbd-gap 0.0005 --max-iterations 30 --cut-strategy standard
 ```
 
-Small monolithic validation:
+Tighter small validation:
 
 ```powershell
-python src\run_optimization.py --dataset small --scenario with_redirection --threads 10 --mip-gap 0.001
+python src_lbbd\run_lbbd.py --dataset small --scenario with_redirection --threads 8 --master-gap 0.0002 --subproblem-gap 0.0001 --lbbd-gap 0.0002 --max-iterations 40 --cut-strategy standard
 ```
 
-Full LBBD run:
+Small monolithic benchmark:
 
 ```powershell
-python src_lbbd\run_lbbd.py --dataset full --scenario with_redirection --preset full_strict --threads 16 --cut-strategy corepoint --mip-reconstruction-frequency 2
+python src\run_optimization.py --dataset small --scenario with_redirection --threads 8 --mip-gap 0.0002
 ```
 
-### Scenario and technology switches
+The monolithic full-data run can be memory intensive because the type-aware redirection tensor scales with active redirection arc-slots and origin/destination charger-type pairs.
+
+### Full LBBD run
+
+Recommended workstation/HPC run:
+
+```powershell
+python src_lbbd\run_lbbd.py --dataset full --scenario with_redirection --threads 16 --master-gap 0.002 --subproblem-gap 0.001 --lbbd-gap 0.001 --max-iterations 25 --time-limit 64800 --cut-strategy standard
+```
+
+Memory-guarded smoke-test run:
+
+```powershell
+python src_lbbd\run_lbbd.py --dataset full --scenario with_redirection --threads 6 --master-gap 0.005 --subproblem-gap 0.001 --lbbd-gap 0.003 --max-iterations 20 --time-limit 64800 --cut-strategy standard
+```
+
+Advanced-cut diagnostic run:
+
+```powershell
+python src_lbbd\run_lbbd.py --dataset small --scenario with_redirection --threads 8 --master-gap 0.0002 --subproblem-gap 0.0001 --lbbd-gap 0.0002 --max-iterations 40 --cut-strategy corepoint --core-weight 0.35 --pareto-tolerance 1e-7
+```
+
+---
+
+## Scenario and technology switches
 
 | Option | Values / usage | Effect |
 |---|---|---|
 | `--dataset` | `small`, `full` | Selects input data from `config/paths.json`. |
-| `--scenario` | `no_redirection`, `with_redirection` | Enables or disables redirection. |
+| `--scenario` | `no_redirection`, `with_redirection` | Enables or disables spatial redirection. |
 | `--disable-pv` | flag | Removes PV investment and dispatch. |
 | `--disable-bess` | flag | Removes BESS investment, dispatch, and SoC dynamics. |
 | `--hard-no-slack` | flag | Enforces zero slack where supported; mainly for validated feasible cases. |
@@ -142,81 +196,69 @@ Common scenario modifiers:
 | PV + BESS, no redirection | `--scenario no_redirection` |
 | PV + BESS, with redirection | `--scenario with_redirection` |
 
-### Presets and solver controls
+---
+
+## Solver and LBBD controls
 
 | Option | Values / usage | Effect |
 |---|---|---|
-| `--preset` | `small_validation`, `full_default`, `full_strict` | Applies predefined validation or full-scale run settings. |
-| `--threads` | integer | Number of Gurobi threads. |
+| `--threads` | integer | Number of Gurobi threads. Lower values can reduce memory pressure. |
 | `--time-limit` | seconds | Solver time limit. |
 | `--master-gap` | float | Relative MIP gap for the LBBD master. |
-| `--subproblem-gap` | float | Relative MIP gap for integer redirection reconstruction. |
-| `--lbbd-gap` | float | LBBD convergence tolerance. |
+| `--subproblem-gap` | float | Relative tolerance passed to subproblem solves where relevant. |
+| `--lbbd-gap` | float | LBBD convergence tolerance computed from the global master upper bound and best certified feasible lower bound. |
 | `--max-iterations` | integer | Maximum LBBD iterations. |
-| `--mip-gap` | float | Monolithic MIP gap; also retained as a compatibility alias where supported. |
-
-Preset guidance:
-
-| Preset | Intended use |
-|---|---|
-| `small_validation` | Debugging, validation against monolithic results, and export checks. |
-| `full_default` | Standard full-data LBBD runs. |
-| `full_strict` | Tighter full-data runs after data and model validation. |
-
-### LBBD acceleration options
-
-| Option | Values / usage | Effect |
-|---|---|---|
-| `--cut-strategy` | `standard`, `corepoint`, `mw`, `pareto` | Selects the redirection cut-generation strategy. |
-| `--max-cuts-per-iteration` | integer | Limits each iteration to the most violated cuts. |
+| `--cut-strategy` | `standard`, `corepoint`, `mw`, `pareto` | Selects the Benders cut-selection strategy. |
+| `--max-cuts-per-iteration` | integer | Limits each iteration to the most violated candidate cuts. |
 | `--min-cut-violation` | float | Filters weakly violated cuts. |
-| `--mip-reconstruction-frequency` | integer | Solves integer redirection reconstruction every `K` iterations. |
-| `--core-weight` | float | Moving-average weight for the core/reference point. |
-| `--core-floor-kwh` | float | Positive floor for core-point supply and spare-capacity values. |
+| `--core-weight` | float | Moving-average weight for updating the core/reference point. |
+| `--core-floor-kwh` | float | Positive floor used in advanced cut-selection reference points. |
 | `--pareto-tolerance` | float | Tolerance for the auxiliary Pareto/core-point dual-face restriction. |
+| `--write-lp` | flag | Writes LP files for debugging. |
 
-Ablation run without PV or BESS:
-
-```powershell
-python src_lbbd\run_lbbd.py --dataset full --scenario with_redirection --preset full_default --threads 16 --disable-pv --disable-bess --cut-strategy corepoint
-```
-
-Example no-redirection PV+BESS baseline:
-
-```powershell
-python src_lbbd\run_lbbd.py --dataset full --scenario no_redirection --preset full_default --threads 16
-```
+For the monolithic workflow, use `--mip-gap` to control the Gurobi MIP gap.
 
 ---
 
 ## Outputs
 
-Main result files (in runs folder):
+Main output files are written under a timestamped folder in `runs/`. LBBD run folders include `LBBD_Standard` for the validated standard-cut workflow and `LBBD_advCuts_<strategy>` for advanced-cut diagnostics.
 
 | File | Contents |
 |---|---|
-| `results/run_summary.csv` | Run-level objective, gap, technology, and status summary. |
-| `results/quality_checks.csv` | Automated feasibility and consistency checks. |
+| `README_RUN.txt` | Terminal transcript and run metadata. |
+| `logs/lbbd_manifest.json` | Solver settings, technology switches, dataset, and cut strategy. |
+| `logs/gurobi_run.log` | Gurobi log for the current master solve. |
 | `results/model_summary.csv` | Economic, energy, infrastructure, and capacity metrics. |
+| `results/lbbd_bounds_summary.csv` | certified LBBD upper/lower bounds and gap. |
+| `results/quality_checks.csv` | Automated feasibility and residual checks. |
+| `results/export_consistency_checks.csv` | Consistency checks between aggregate and type-reconstructed redirection exports. |
 | `results/infrastructure_by_hex.csv` | Cell-level charger, PV, BESS, footprint, and capacity outputs. |
 | `results/energy_by_charger_type.csv` | Annual served energy and utilization by charger type. |
-| `results/redirections.csv` | Redirected energy by origin, destination, month, and slot. |
-| `results/redirections_by_type.csv` | Type-aware origin/destination charger-type redirection flows. |
-| `results/origin_type_allocation_or_benchmark_tariff.csv` | Origin-type tariff accounting data. |
+| `results/redirections.csv` | Aggregate redirected energy by origin, destination, month, and slot. |
+| `results/redirections_by_type.csv` | Type-aware origin/destination charger-type redirection flows reconstructed by the subproblem. |
+| `results/redirection_slot_balance.csv` | Slot-level aggregate redirection balance diagnostics. |
+| `results/origin_type_q.csv` | Origin-type tariff accounting data. |
+| `results/destination_type_w.csv` | Incoming destination-type service accounting data. |
 | `results/hourly_energy.csv` | Cell-month-slot energy, PV, grid, BESS, and redirection values. |
 | `results/slack.csv` | Nonzero slack values, if present. |
-| `results/lbbd_iteration_history.csv` | LBBD upper/lower bound and cut progress. |
-| `results/lbbd_subproblem_summary.csv` | Slot-wise LP/MIP recourse summaries. |
-| `results/lbbd_cuts.csv` | Generated cut metadata. |
-| `results/combined_results.xlsx` | Convenience workbook. CSV files remain authoritative for very large tables. |
+| `iterations/lbbd_iteration_history.csv` | LBBD upper/lower bound and cut progress. |
+| `iterations/type_assignment_subproblem_summary.csv` | Slot-wise type-assignment LP recourse summaries. |
+| `iterations/type_assignment_cuts.csv` | Generated type-assignment Benders cut metadata. |
+| `results/aw_vs_monolithic_comparison.csv` or `results/lbbd_vs_monolithic_comparison.csv` | Component-level comparison generated by `compare_runs.py`, depending on the code version used. |
+
+CSV files are the authoritative outputs for large tables. Any convenience workbook should be treated as secondary.
+Small nonzero differences between LBBD and monolithic incumbents are expected for large mixed-integer models when both methods stop within their respective optimality gaps.
 
 ---
 
 ## Reproducibility notes
 
-The full type-aware redirection model is difficult to solve monolithically because redirection variables scale with active arc-slots and origin/destination charger-type pairs. The LBBD implementation avoids constructing all redirection variables in one model by solving compact slot-wise redirection subproblems and adding cuts to the master.
+The full monolithic type-aware redirection model is difficult to solve because redirection variables scale with active arc-slots and origin/destination charger-type pairs. The LBBD implementation reduces memory pressure by keeping aggregate physical redirection and energy-system coupling in the master while reconstructing charger-type-pair redirection through slot-wise LP recourse.
 
-For this maximization model, the reported LBBD gap is computed from the master upper bound and the best feasible MIP reconstruction lower bound. Small nonzero gaps are expected unless both bounds coincide within the requested tolerance.
+For this maximization model, the reported LBBD gap is computed from the global master upper bound and the best certified feasible lower bound. Small nonzero gaps are expected unless both bounds coincide within the requested tolerance.
+
+For full-data runs on memory-limited machines, reduce `--threads`, use a looser `--master-gap`, and rely on the node-file settings in `config/solver_gurobi.json` where configured. Full-data runs are recommended on a workstation or HPC node when available.
 
 ---
 
@@ -235,8 +277,7 @@ For issues, feature requests, or reproducibility questions, please open a GitHub
 
 ### Charging infrastructure optimization
 
-**Parishwad, Omkar; Najafi, Arsalan; Gao, Kun** — *Joint optimization of charging infrastructure and renewable energies with battery storage considering user redirection incentives.*  
-[SSRN preprint](https://doi.org/10.2139/ssrn.5395539)
+**Parishwad, Omkar; Najafi, Arsalan; Gao, Kun** — *Joint optimization of charging infrastructure and renewable energies with battery storage considering user redirection incentives.* (preprint)
 
 ### Demand simulation source
 
@@ -244,5 +285,5 @@ Charging-demand inputs are based on the MATSim-driven simulation framework [`Urb
 
 Published demand-modeling article:
 
-**Parishwad, Omkar; Gao, Kun; Najafi, Arsalan** — *Integrated and Agent-Based Charging Demand Prediction Considering Cost-Aware and Adaptive Charging Behavior*. **Transportation Research Part D: Transport and Environment**, 154 (2026), 105285.  
+**Parishwad, Omkar; Gao, Kun; Najafi, Arsalan** — *Integrated and agent-based charging demand prediction considering cost aware and adaptive charging behavior*. **Transportation Research Part D: Transport and Environment**, 154 (2026), 105285.  
 DOI: <https://doi.org/10.1016/j.trd.2026.105285>

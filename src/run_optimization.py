@@ -91,6 +91,29 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable BESS investment and BESS operation."
     )
+    parser.add_argument(
+        "--speed-car-kmh",
+        type=float,
+        default=None,
+        help="Sensitivity override for model_config.json speed_car_kmh."
+    )
+    parser.add_argument(
+        "--value-time-sek-per-h",
+        type=float,
+        default=None,
+        help="Sensitivity override for model_config.json value_time_sek_per_h."
+    )
+    parser.add_argument(
+        "--max-redirection-distance-km",
+        type=float,
+        default=None,
+        help="Sensitivity override for model_config.json max_redirection_distance_km."
+    )
+    parser.add_argument(
+        "--sensitivity-name",
+        default=None,
+        help="Optional short label appended to the run folder name for sensitivity runs."
+    )
     return parser.parse_args()
 
 
@@ -126,6 +149,47 @@ def load_configs(project_root: Path, dataset_arg: str | None) -> tuple[dict, dic
 
     return paths, model_cfg, solver_cfg, dataset
 
+
+
+def _format_sensitivity_value(value: float) -> str:
+    text = (f"{float(value):g}").replace("-", "m").replace(".", "p")
+    return text
+
+
+def apply_sensitivity_overrides(model_cfg: dict, args: argparse.Namespace) -> dict:
+    """Apply command-line sensitivity overrides to the loaded model config.
+
+    The base config file is not modified on disk. The returned dictionary is a
+    record of the parameters changed for this run and is written to the terminal
+    transcript and run metadata.
+    """
+    overrides = {}
+    if args.speed_car_kmh is not None:
+        model_cfg["speed_car_kmh"] = float(args.speed_car_kmh)
+        overrides["speed_car_kmh"] = float(args.speed_car_kmh)
+    if args.value_time_sek_per_h is not None:
+        model_cfg["value_time_sek_per_h"] = float(args.value_time_sek_per_h)
+        overrides["value_time_sek_per_h"] = float(args.value_time_sek_per_h)
+    if args.max_redirection_distance_km is not None:
+        model_cfg["max_redirection_distance_km"] = float(args.max_redirection_distance_km)
+        overrides["max_redirection_distance_km"] = float(args.max_redirection_distance_km)
+    return overrides
+
+
+def make_sensitivity_suffix(args: argparse.Namespace, overrides: dict) -> str:
+    if args.sensitivity_name:
+        label = str(args.sensitivity_name).strip().replace(" ", "_")
+        return "_" + label if label else ""
+    if not overrides:
+        return ""
+    parts = []
+    if "speed_car_kmh" in overrides:
+        parts.append("speed" + _format_sensitivity_value(overrides["speed_car_kmh"]) + "kmh")
+    if "value_time_sek_per_h" in overrides:
+        parts.append("vot" + _format_sensitivity_value(overrides["value_time_sek_per_h"]) + "sekph")
+    if "max_redirection_distance_km" in overrides:
+        parts.append("dist" + _format_sensitivity_value(overrides["max_redirection_distance_km"]) + "km")
+    return "_" + "_".join(parts)
 
 def run_smoke(project_root: Path, paths: dict) -> int:
     print("========== ENVIRONMENT ==========")
@@ -187,6 +251,7 @@ def make_run_dir(
     hard_no_slack: bool,
     disable_pv: bool,
     disable_bess: bool,
+    sensitivity_suffix: str = "",
 ) -> Path:
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     slack_suffix = "hardnoslack" if hard_no_slack else "slackpenalty"
@@ -202,7 +267,7 @@ def make_run_dir(
 
     run_dir = (
         Path(paths["runs_root"])
-        / f"{stamp}_{dataset}_{scenario}_{tech_suffix}_{slack_suffix}"
+        / f"{stamp}_{dataset}_{scenario}_{tech_suffix}{sensitivity_suffix}_{slack_suffix}"
     )
 
     for sub in ["logs", "results", "model", "nodefiles"]:
@@ -276,36 +341,92 @@ def apply_technology_switches(model, disable_pv: bool, disable_bess: bool) -> No
                         model.delta[i, mon, t].fix(0)
 
 
-def main() -> int:
-    args = parse_args()
-    project_root = Path(args.project_root).resolve()
-    paths, model_cfg, solver_cfg, dataset = load_configs(project_root, args.dataset)
 
-    if args.threads is not None:
-        solver_cfg["threads"] = int(args.threads)
-    if args.time_limit is not None:
-        solver_cfg["time_limit_seconds"] = int(args.time_limit)
-    if args.mip_gap is not None:
-        solver_cfg["mip_gap"] = float(args.mip_gap)
 
-    if args.smoke:
-        return run_smoke(project_root, paths)
+class TeeStream:
+    """Write terminal output to multiple streams at once."""
 
-    run_dir = make_run_dir(
-        paths=paths,
-        scenario=args.scenario,
-        dataset=dataset,
-        hard_no_slack=args.hard_no_slack,
-        disable_pv=args.disable_pv,
-        disable_bess=args.disable_bess,
+    def __init__(self, *streams):
+        self.streams = [s for s in streams if s is not None]
+
+    def write(self, message: str) -> int:
+        for stream in self.streams:
+            try:
+                stream.write(message)
+            except UnicodeEncodeError:
+                stream.write(message.encode("utf-8", errors="replace").decode("utf-8"))
+        self.flush()
+        return len(message)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            try:
+                stream.flush()
+            except Exception:
+                pass
+
+
+def write_run_folder_readme(
+    run_dir: Path,
+    dataset: str,
+    scenario: str,
+    disable_pv: bool,
+    disable_bess: bool,
+    sensitivity_overrides: dict | None = None,
+) -> None:
+    readme = run_dir / "README_RUN_FOLDER.txt"
+    tech = (
+        "no PV, no BESS" if disable_pv and disable_bess else
+        "PV enabled, BESS disabled" if (not disable_pv and disable_bess) else
+        "PV disabled, BESS enabled" if (disable_pv and not disable_bess) else
+        "PV enabled, BESS enabled"
+    )
+    sensitivity_overrides = sensitivity_overrides or {}
+    sensitivity_text = "None" if not sensitivity_overrides else ", ".join(
+        f"{k}={v}" for k, v in sensitivity_overrides.items()
+    )
+    readme.write_text(
+        "Monolithic optimization run folder\n"
+        "==================================\n\n"
+        "This folder is produced by src/run_optimization.py. It contains the outputs from the full monolithic Pyomo/Gurobi formulation.\n\n"
+        "Core files:\n"
+        "- README_RUN.txt: complete terminal transcript from this run.\n"
+        "- results/model_summary.csv: detailed economic, energy, and infrastructure metrics.\n"
+        "- results/infrastructure_by_hex.csv: charger/PV/BESS deployment by cell.\n"
+        "- results/redirections.csv and redirections_by_type.csv: optimized redirected flows.\n"
+        "- results/hourly_energy.csv: slot-level energy dispatch.\n"
+        "- logs/gurobi_run.log: Gurobi solver log.\n"
+        "- logs/pyomo_solve.log: Pyomo solve log.\n\n"
+        f"Scenario: {scenario}\n"
+        f"Dataset: {dataset}\n"
+        f"Technology: {tech}\n"
+        f"Sensitivity overrides: {sensitivity_text}\n",
+        encoding="utf-8",
     )
 
+
+def _run_optimization_impl(
+    args: argparse.Namespace,
+    project_root: Path,
+    paths: dict,
+    model_cfg: dict,
+    solver_cfg: dict,
+    dataset: str,
+    run_dir: Path,
+) -> int:
     print(f"Project root  : {project_root}")
     print(f"Dataset       : {dataset}")
     print(f"Scenario      : {args.scenario}")
     print(f"Disable PV    : {args.disable_pv}")
     print(f"Disable BESS  : {args.disable_bess}")
     print(f"Hard no-slack : {args.hard_no_slack}")
+    sensitivity_overrides = getattr(args, "_sensitivity_overrides", {}) or {}
+    if sensitivity_overrides:
+        print("Sensitivity overrides:")
+        for key, value in sensitivity_overrides.items():
+            print(f"  {key}: {value}")
+    else:
+        print("Sensitivity overrides: none")
     print(f"Run directory : {run_dir}")
 
     print("Loading inputs...")
@@ -359,6 +480,72 @@ def main() -> int:
 
     print(f"Run finished successfully. Run directory: {run_dir}")
     return 0
+
+
+def main() -> int:
+    args = parse_args()
+    project_root = Path(args.project_root).resolve()
+    paths, model_cfg, solver_cfg, dataset = load_configs(project_root, args.dataset)
+    sensitivity_overrides = apply_sensitivity_overrides(model_cfg, args)
+    args._sensitivity_overrides = sensitivity_overrides
+    sensitivity_suffix = make_sensitivity_suffix(args, sensitivity_overrides)
+
+    if args.threads is not None:
+        solver_cfg["threads"] = int(args.threads)
+    if args.time_limit is not None:
+        solver_cfg["time_limit_seconds"] = int(args.time_limit)
+    if args.mip_gap is not None:
+        solver_cfg["mip_gap"] = float(args.mip_gap)
+
+    if args.smoke:
+        return run_smoke(project_root, paths)
+
+    run_dir = make_run_dir(
+        paths=paths,
+        scenario=args.scenario,
+        dataset=dataset,
+        hard_no_slack=args.hard_no_slack,
+        disable_pv=args.disable_pv,
+        disable_bess=args.disable_bess,
+        sensitivity_suffix=sensitivity_suffix,
+    )
+    write_run_folder_readme(
+        run_dir,
+        dataset,
+        args.scenario,
+        args.disable_pv,
+        args.disable_bess,
+        sensitivity_overrides=sensitivity_overrides,
+    )
+
+    terminal_log = run_dir / "README_RUN.txt"
+    with terminal_log.open("w", encoding="utf-8", errors="replace") as log_file:
+        tee_out = TeeStream(sys.__stdout__, log_file)
+        tee_err = TeeStream(sys.__stderr__, log_file)
+        from contextlib import redirect_stdout, redirect_stderr
+        import traceback
+
+        with redirect_stdout(tee_out), redirect_stderr(tee_err):
+            print("========== MONOLITHIC TERMINAL LOG ==========")
+            print(f"Run transcript : {terminal_log}")
+            print("=============================================\n")
+            try:
+                rc = _run_optimization_impl(
+                    args=args,
+                    project_root=project_root,
+                    paths=paths,
+                    model_cfg=model_cfg,
+                    solver_cfg=solver_cfg,
+                    dataset=dataset,
+                    run_dir=run_dir,
+                )
+                print(f"\nTerminal transcript written to: {terminal_log}")
+                return rc
+            except Exception:
+                print("\nERROR: Monolithic run failed. Full traceback follows.\n")
+                traceback.print_exc()
+                print(f"\nTerminal transcript written to: {terminal_log}")
+                return 1
 
 
 if __name__ == "__main__":
