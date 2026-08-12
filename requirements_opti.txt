@@ -5,3 +5,4 @@ numpy
 geopandas
 networkx
 openpyxl
+psutil

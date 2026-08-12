@@ -1,6 +1,0 @@
-data_root: "data"
-demand_shapefile: "data/full/demandHexGrid.shp"
-parking_shapefile: "data/full/CharParkfull.shp"
-distance_csv: "data/full/shortestpath.csv"
-spot_price_csv: "data/ElPrice.csv"
-runs_root: "runs"

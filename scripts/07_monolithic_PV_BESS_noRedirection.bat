@@ -1,10 +1,10 @@
 @echo off
+setlocal
 cd /d "%~dp0.."
-call conda activate omkarp
-set PYTHONUTF8=1
-set PYTHONIOENCODING=utf-8:replace
-set DATASET=full
-set THREADS=10
-set MIPGAP=0.0001
-python src\run_optimization.py --dataset %DATASET% --scenario no_redirection --threads %THREADS% --mip-gap %MIPGAP%
-pause
+set "DATASET=%~1"
+if "%DATASET%"=="" set "DATASET=full"
+
+echo Running Monolithic: %DATASET% / PV_BESS_noRedirection
+python src\run_optimization.py --dataset %DATASET% --scenario no_redirection
+if errorlevel 1 exit /b %errorlevel%
+endlocal

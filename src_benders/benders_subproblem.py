@@ -159,8 +159,11 @@ def solve_type_assignment_lp(
 
     m = pyo.ConcreteModel()
     m.A = pyo.Set(dimen=2, initialize=slot_arcs)
-    m.O = pyo.Set(dimen=2, initialize=[k for k, v in R.items() if v > tol])
-    m.D = pyo.Set(dimen=2, initialize=[k for k, v in W.items() if v > tol])
+    # The recourse matrix must be independent of the current RHS.  Zero R/W
+    # marginals therefore remain explicit equalities; otherwise z variables of a
+    # zero-valued type can carry flow without being linked to the master.
+    m.O = pyo.Set(dimen=2, initialize=[(i, c) for i in origins for c in pubs])
+    m.D = pyo.Set(dimen=2, initialize=[(j, c) for j in dests for c in pubs])
     m.C = pyo.Set(initialize=pubs)
     m.ZIDX = pyo.Set(dimen=4, initialize=[(i, j, co, cd) for (i, j) in slot_arcs for co in pubs for cd in pubs])
     m.z = pyo.Var(m.ZIDX, domain=pyo.NonNegativeReals)
@@ -183,7 +186,7 @@ def solve_type_assignment_lp(
     opt.options["Threads"] = max(1, min(int(solver_cfg.get("threads", 1)), 2))
     opt.options["Presolve"] = int(solver_cfg.get("presolve", 2))
     opt.options["NumericFocus"] = int(solver_cfg.get("numeric_focus", 2))
-    opt.options["MIPGap"] = float(solver_cfg.get("mip_gap", 0.0))
+    opt.options["Method"] = 1
     opt.options["OutputFlag"] = 0
     opt.options["TimeLimit"] = max(30, min(int(solver_cfg.get("time_limit_seconds", 300)), 900))
     if run_dir is not None:

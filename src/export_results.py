@@ -15,10 +15,15 @@ def compute_core_metrics(model, data: dict, cfg: dict) -> dict:
         N_MONTH[mon] * sv(model.Price[c]) * sv(model.edisp[i, mon, t, c, b])
         for i in model.I for mon in model.M for t in model.H for b in model.B for c in model.C_pub
     )
-    grid_cost = sum(
-        N_MONTH[mon] * sv(model.tou[mon, t]) * (sv(model.grid_dir[i, mon, t]) + sv(model.grid_batt[i, mon, t]))
+    grid_direct_cost = sum(
+        N_MONTH[mon] * sv(model.tou[mon, t]) * sv(model.grid_dir[i, mon, t])
         for i in model.I for mon in model.M for t in model.H
     )
+    grid_battery_cost = sum(
+        N_MONTH[mon] * sv(model.tou[mon, t]) * sv(model.grid_batt[i, mon, t])
+        for i in model.I for mon in model.M for t in model.H
+    )
+    grid_cost = grid_direct_cost + grid_battery_cost
     redir_distance_cost = sum(
         N_MONTH[mon] * (
             sv(model.T[i, j]) * sv(model.n_trip[i, j, mon, t])
@@ -35,7 +40,9 @@ def compute_core_metrics(model, data: dict, cfg: dict) -> dict:
         for i in model.I for mon in model.M for t in model.H for b in model.B
     )
     capex_chargers = DAYS * sum(sv(model.PVF_cost[c]) * sv(model.x[i, c]) for i in model.I for c in model.C_pub)
-    capex_energy = DAYS * sum(sv(model.PVF_PV) * sv(model.PV[i]) + sv(model.PVF_Batt) * sv(model.Batt[i]) for i in model.I)
+    capex_pv = DAYS * sum(sv(model.PVF_PV) * sv(model.PV[i]) for i in model.I)
+    capex_bess = DAYS * sum(sv(model.PVF_Batt) * sv(model.Batt[i]) for i in model.I)
+    capex_energy = capex_pv + capex_bess
     ann_redir = sum(N_MONTH[mon] * sv(model.z[i, j, mon, t]) for (i, j, mon, t) in model.A)
 
     ann_grid_direct = sum(N_MONTH[mon] * sv(model.grid_dir[i, mon, t]) for i in model.I for mon in model.M for t in model.H)
@@ -43,17 +50,35 @@ def compute_core_metrics(model, data: dict, cfg: dict) -> dict:
     ann_pv_direct = sum(N_MONTH[mon] * sv(model.pv_dir[i, mon, t]) for i in model.I for mon in model.M for t in model.H)
     ann_pv_batt = sum(N_MONTH[mon] * sv(model.pv_batt[i, mon, t]) for i in model.I for mon in model.M for t in model.H)
     batt_dis = sum(N_MONTH[mon] * sv(model.batt_discharge[i, mon, t]) for i in model.I for mon in model.M for t in model.H)
+    annual_public_demand = sum(
+        N_MONTH[mon] * sv(model.Demand[i, mon, t, "public"])
+        for i in model.I for mon in model.M for t in model.H
+    )
+    annual_slack = sum(
+        N_MONTH[mon] * sv(model.slack[i, mon, t, b])
+        for i in model.I for mon in model.M for t in model.H for b in model.B
+    )
+    public_capacity_slot = sum(
+        sv(model.K[c]) * sv(model.x[i, c]) for i in model.I for c in model.C_pub
+    )
+    active_redirection_arcs = sum(
+        1 for a in model.A if sv(model.z[a]) > 1e-8
+    )
 
     rows = {
         "dataset": data.get("dataset", "unknown"),
         "annual_profit_SEK": sv(model.obj),
         "revenue_all_chargers_SEK": rev_total,
         "grid_cost_SEK": grid_cost,
+        "grid_direct_cost_SEK": grid_direct_cost,
+        "grid_to_battery_cost_SEK": grid_battery_cost,
         "redirection_distance_cost_SEK": redir_distance_cost,
         "redirection_price_compensation_SEK": redir_price_cost,
         "redirection_total_cost_SEK": redir_distance_cost + redir_price_cost,
         "slack_penalty_SEK": slack_pen,
         "capex_chargers_SEK": capex_chargers,
+        "capex_PV_SEK": capex_pv,
+        "capex_BESS_SEK": capex_bess,
         "capex_PV_BESS_SEK": capex_energy,
         "grid_direct_kWh": ann_grid_direct,
         "grid_to_battery_kWh": ann_grid_batt,
@@ -62,7 +87,16 @@ def compute_core_metrics(model, data: dict, cfg: dict) -> dict:
         "pv_to_battery_kWh": ann_pv_batt,
         "pv_used_total_kWh": ann_pv_direct + ann_pv_batt,
         "battery_discharge_kWh": batt_dis,
+        "annual_public_demand_kWh": annual_public_demand,
         "energy_redirected_kWh": ann_redir,
+        "share_redirected_public_demand": ann_redir / annual_public_demand if annual_public_demand > 0 else 0.0,
+        "active_redirection_arcs": active_redirection_arcs,
+        "public_charger_capacity_kWh_per_slot": public_capacity_slot,
+        "annual_slack_kWh": annual_slack,
+        "redirection_trip_equivalents_annual": ann_redir / sv(model.x_kWh) if sv(model.x_kWh) > 0 else 0.0,
+        "redirection_full_trip_bundles_annual": sum(
+            N_MONTH[mon] * sv(model.n_trip[i, j, mon, t]) for (i, j, mon, t) in model.A
+        ),
         "PV_panels_installed": sum(sv(model.PV[i]) for i in model.I),
         "battery_units_installed": sum(sv(model.Batt[i]) for i in model.I),
     }
@@ -70,8 +104,15 @@ def compute_core_metrics(model, data: dict, cfg: dict) -> dict:
         installed = sum(sv(model.x[i, c]) for i in model.I)
         energy_c = sum(N_MONTH[mon] * sv(model.edisp[i, mon, t, c, b]) for i in model.I for mon in model.M for t in model.H for b in model.B)
         annual_cap_c = installed * sv(model.K[c]) * len(list(model.H)) * DAYS
+        revenue_c = sum(
+            N_MONTH[mon] * sv(model.Price[c]) * sv(model.edisp[i, mon, t, c, b])
+            for i in model.I for mon in model.M for t in model.H for b in model.B
+        )
+        capex_c = DAYS * sum(sv(model.PVF_cost[c]) * sv(model.x[i, c]) for i in model.I)
         rows[f"chargers_{c}_installed"] = installed
         rows[f"energy_{c}_kWh"] = energy_c
+        rows[f"revenue_{c}_SEK"] = revenue_c
+        rows[f"capex_chargers_{c}_SEK"] = capex_c
         rows[f"capacity_upper_bound_{c}_kWh"] = annual_cap_c
         rows[f"capacity_ratio_{c}"] = energy_c / annual_cap_c if annual_cap_c > 0 else 0.0
     rows["max_abs_soc_gap_Jan0_Dec48_kWh"] = max(abs(sv(model.soc[i, "December", max(model.H)]) - sv(model.soc[i, "January", 0])) for i in model.I)
@@ -234,6 +275,57 @@ def export_hourly_energy(model, data: dict, results_dir: Path) -> pd.DataFrame:
     return df
 
 
+def export_supply_by_demand_class(model, data: dict, results_dir: Path) -> pd.DataFrame:
+    """Export an accounting allocation of pooled charger-side energy by demand class.
+
+    Grid, direct PV, and BESS discharge are pooled in the optimization energy balance.
+    They are therefore allocated ex post to residual-home and public service in
+    proportion to their served energy at each cell-month-slot. This preserves all
+    source and demand-class totals without changing the optimization formulation.
+    """
+    total_home = data.get("home_demand_total_event", {})
+    private_home = data.get("home_private_served_event", {})
+    rows = []
+    for i in model.I:
+        ii = int(i)
+        for mon in model.M:
+            for t in model.H:
+                tt = int(t)
+                served_home = sum(sv(model.edisp[i, mon, t, c, "home"]) for c in model.C_pub)
+                served_public = sum(sv(model.edisp[i, mon, t, c, "public"]) for c in model.C_pub)
+                served_total = served_home + served_public
+                home_share = served_home / served_total if served_total > 1e-12 else 0.0
+                public_share = served_public / served_total if served_total > 1e-12 else 0.0
+                grid = sv(model.grid_dir[i, mon, t])
+                pv = sv(model.pv_dir[i, mon, t])
+                bess = sv(model.batt_discharge[i, mon, t])
+                allocated_total = grid + pv + bess
+                rows.append({
+                    "HexID": ii,
+                    "Month": str(mon),
+                    "TimeIndex": tt,
+                    "DaysInMonth": int(data["N_MONTH"][mon]),
+                    "Demand_home_total_kWh_day": float(total_home.get((ii, tt), sv(model.Demand[i, mon, t, "home"]) + float(private_home.get((ii, tt), 0.0)))),
+                    "Demand_public_base_kWh_day": sv(model.Demand[i, mon, t, "public"]),
+                    "Home_private_served_kWh_day": float(private_home.get((ii, tt), 0.0)),
+                    "Home_residual_served_by_public_kWh_day": served_home,
+                    "Public_served_by_public_kWh_day": served_public,
+                    "Grid_to_home_residual_allocated_kWh_day": grid * home_share,
+                    "PV_to_home_residual_allocated_kWh_day": pv * home_share,
+                    "BESS_to_home_residual_allocated_kWh_day": bess * home_share,
+                    "Grid_to_public_allocated_kWh_day": grid * public_share,
+                    "PV_to_public_allocated_kWh_day": pv * public_share,
+                    "BESS_to_public_allocated_kWh_day": bess * public_share,
+                    "Slack_home_kWh_day": sv(model.slack[i, mon, t, "home"]),
+                    "Slack_public_kWh_day": sv(model.slack[i, mon, t, "public"]),
+                    "Source_allocation_reconciliation_kWh": allocated_total - served_total,
+                    "AllocationMethod": "Proportional allocation of pooled charger-side supply to served demand classes within each cell-month-slot",
+                })
+    df = pd.DataFrame(rows)
+    df.to_csv(results_dir / "supply_by_demand_class.csv", index=False)
+    return df
+
+
 def export_slack(model, data: dict, results_dir: Path) -> pd.DataFrame:
     rows = []
     for i in model.I:
@@ -377,6 +469,7 @@ def export_all(model, data: dict, cfg: dict, run_dir: Path) -> dict[str, pd.Data
         "redirections_by_type": export_redirections_by_type(model, data, results_dir),
         "origin_type_q": export_origin_type_allocation(model, data, results_dir),
         "hourly_energy": export_hourly_energy(model, data, results_dir),
+        "supply_by_demand_class": export_supply_by_demand_class(model, data, results_dir),
         "slack": export_slack(model, data, results_dir),
         "slack_diag_hex": export_slack_diagnostics_by_hex(model, data, results_dir),
         "slack_diag_month": export_slack_diagnostics_by_hex_month(model, data, results_dir),

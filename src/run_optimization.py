@@ -6,6 +6,7 @@ import argparse
 import importlib
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -23,6 +24,10 @@ from preprocessing import preprocess
 from model_builder import apply_scenario, apply_hard_no_slack, build_model
 from solve_model import solve_model
 from export_results import export_all, print_summary
+from visualize_results import generate_run_figures
+from run_profiles import apply_profile_defaults, load_run_profile
+from technology_switches import apply_technology_switches
+from computational_complexity import ResourceMonitor, model_statistics, write_run_complexity
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -72,6 +77,57 @@ def parse_args() -> argparse.Namespace:
         help="Override Gurobi MIPGap."
     )
     parser.add_argument(
+        "--root-method",
+        choices=["auto", "primal", "dual", "barrier", "concurrent", "deterministic-concurrent"],
+        default=None,
+        help="Gurobi method for the root LP relaxation. Use 'dual' for memory-constrained full runs."
+    )
+    parser.add_argument(
+        "--node-method",
+        choices=["auto", "primal", "dual", "barrier"],
+        default=None,
+        help="Gurobi method for MIP node relaxations."
+    )
+    parser.add_argument(
+        "--nodefile-start",
+        type=float,
+        default=None,
+        help="GB of branch-and-bound node memory before nodes are compressed to disk."
+    )
+    parser.add_argument(
+        "--soft-mem-limit-gb",
+        type=float,
+        default=None,
+        help="Graceful Gurobi memory limit in GB. Leave headroom for Python/Pyomo and the OS."
+    )
+    parser.add_argument(
+        "--pre-sparsify",
+        type=int,
+        choices=[-1, 0, 1, 2],
+        default=None,
+        help="Override Gurobi PreSparsify."
+    )
+    parser.add_argument(
+        "--aggregate",
+        type=int,
+        choices=[-1, 0, 1, 2],
+        default=None,
+        help="Override Gurobi Aggregate presolve setting."
+    )
+    parser.add_argument(
+        "--pre-passes",
+        type=int,
+        default=None,
+        help="Override Gurobi PrePasses."
+    )
+    parser.add_argument(
+        "--solver-cuts",
+        type=int,
+        choices=[-1, 0, 1, 2, 3],
+        default=None,
+        help="Override Gurobi global Cuts setting."
+    )
+    parser.add_argument(
         "--project-root",
         default=str(PROJECT_ROOT),
         help="Project root folder."
@@ -113,6 +169,24 @@ def parse_args() -> argparse.Namespace:
         "--sensitivity-name",
         default=None,
         help="Optional short label appended to the run folder name for sensitivity runs."
+    )
+    parser.add_argument(
+        "--skip-figures",
+        action="store_true",
+        default=None,
+        help="Skip automatic figure generation after successful result export."
+    )
+    parser.add_argument(
+        "--figures-dpi",
+        type=int,
+        default=300,
+        help="PNG resolution for automatically generated figures."
+    )
+    parser.add_argument(
+        "--max-redirection-arcs-plot",
+        type=int,
+        default=150,
+        help="Maximum number of annual redirection corridors drawn on the flow map."
     )
     return parser.parse_args()
 
@@ -276,71 +350,6 @@ def make_run_dir(
     return run_dir
 
 
-def _fix_if_exists(component, *index):
-    try:
-        component[index].fix(0)
-    except Exception:
-        return
-
-
-def apply_technology_switches(model, disable_pv: bool, disable_bess: bool) -> None:
-    if disable_pv:
-        print("Technology switch: PV disabled.")
-        if hasattr(model, "PV"):
-            for i in model.I:
-                model.PV[i].fix(0)
-
-        if hasattr(model, "pv_dir"):
-            for i in model.I:
-                for mon in model.M:
-                    for t in model.H:
-                        model.pv_dir[i, mon, t].fix(0)
-
-        if hasattr(model, "pv_batt"):
-            for i in model.I:
-                for mon in model.M:
-                    for t in model.H:
-                        model.pv_batt[i, mon, t].fix(0)
-
-    if disable_bess:
-        print("Technology switch: BESS disabled.")
-        if hasattr(model, "Batt"):
-            for i in model.I:
-                model.Batt[i].fix(0)
-
-        soc_time_set = model.Hsoc if hasattr(model, "Hsoc") else model.H
-
-        if hasattr(model, "soc"):
-            for i in model.I:
-                for mon in model.M:
-                    for t in soc_time_set:
-                        model.soc[i, mon, t].fix(0)
-
-        if hasattr(model, "grid_batt"):
-            for i in model.I:
-                for mon in model.M:
-                    for t in model.H:
-                        model.grid_batt[i, mon, t].fix(0)
-
-        if hasattr(model, "pv_batt"):
-            for i in model.I:
-                for mon in model.M:
-                    for t in model.H:
-                        model.pv_batt[i, mon, t].fix(0)
-
-        if hasattr(model, "batt_discharge"):
-            for i in model.I:
-                for mon in model.M:
-                    for t in model.H:
-                        model.batt_discharge[i, mon, t].fix(0)
-
-        if hasattr(model, "delta"):
-            for i in model.I:
-                for mon in model.M:
-                    for t in model.H:
-                        model.delta[i, mon, t].fix(0)
-
-
 
 
 class TeeStream:
@@ -414,8 +423,12 @@ def _run_optimization_impl(
     dataset: str,
     run_dir: Path,
 ) -> int:
+    total_started = time.perf_counter()
+    monitor = ResourceMonitor().start()
+    phase_timing: dict[str, float] = {}
     print(f"Project root  : {project_root}")
     print(f"Dataset       : {dataset}")
+    print(f"Run profile   : {getattr(args, '_run_profile', 'monolithic')}")
     print(f"Scenario      : {args.scenario}")
     print(f"Disable PV    : {args.disable_pv}")
     print(f"Disable BESS  : {args.disable_bess}")
@@ -430,10 +443,14 @@ def _run_optimization_impl(
     print(f"Run directory : {run_dir}")
 
     print("Loading inputs...")
+    phase_started = time.perf_counter()
     raw = load_inputs(paths)
+    phase_timing["input_load_seconds"] = time.perf_counter() - phase_started
 
     print("Preprocessing inputs...")
+    phase_started = time.perf_counter()
     data = preprocess(raw, model_cfg)
+    phase_timing["preprocessing_seconds"] = time.perf_counter() - phase_started
     data["dataset"] = dataset
     data["disable_pv"] = args.disable_pv
     data["disable_bess"] = args.disable_bess
@@ -442,7 +459,10 @@ def _run_optimization_impl(
     print(f"Active redirection arc-slots: {len(data['allowed_st']):,}")
 
     print("Building type-aware Pyomo model...")
+    phase_started = time.perf_counter()
     model = build_model(data, model_cfg)
+    phase_timing["model_build_seconds"] = time.perf_counter() - phase_started
+    main_model_stats = model_statistics(model)
 
     apply_technology_switches(
         model=model,
@@ -461,7 +481,9 @@ def _run_optimization_impl(
         print(f"LP model written to: {lp_path}")
 
     print("Solving with Gurobi...")
+    phase_started = time.perf_counter()
     results = solve_model(model, solver_cfg, run_dir)
+    phase_timing["solve_seconds"] = time.perf_counter() - phase_started
     print(results.solver)
 
     term = str(results.solver.termination_condition).lower()
@@ -471,12 +493,48 @@ def _run_optimization_impl(
             "If --hard-no-slack was used, rerun without it and inspect slack diagnostics."
         )
         print(f"Run directory: {run_dir}")
+        monitor.stop()
+        phase_timing["total_runtime_seconds"] = time.perf_counter() - total_started
+        write_run_complexity(
+            run_dir, "Monolithic", data,
+            phase_timing=phase_timing,
+            model_stats={"main_model": main_model_stats},
+            resource_monitor=monitor,
+            extra_scalars={"termination_infeasible": 1},
+        )
         return 2
 
     print_summary(model, data, model_cfg)
 
     print("Writing CSV/XLSX outputs...")
+    phase_started = time.perf_counter()
     export_all(model, data, model_cfg, run_dir)
+    phase_timing["export_seconds"] = time.perf_counter() - phase_started
+
+    phase_started = time.perf_counter()
+    if not args.skip_figures:
+        print("Generating result figures...")
+        try:
+            generate_run_figures(
+                run_dir=run_dir,
+                project_root=project_root,
+                dataset=dataset,
+                parking_shapefile=paths.get("parking_shapefile"),
+                dpi=max(100, int(args.figures_dpi)),
+                max_flow_arcs=max(1, int(args.max_redirection_arcs_plot)),
+            )
+        except Exception as exc:
+            print(f"WARNING: Figure generation failed without invalidating optimization results: {exc}")
+    phase_timing["figure_generation_seconds"] = time.perf_counter() - phase_started
+    monitor.stop()
+    phase_timing["total_runtime_seconds"] = time.perf_counter() - total_started
+    write_run_complexity(
+        run_dir, "Monolithic", data,
+        phase_timing=phase_timing,
+        model_stats={"main_model": main_model_stats},
+        resource_monitor=monitor,
+        extra_scalars={"solver_mip_gap_requested": solver_cfg.get("mip_gap")},
+    )
 
     print(f"Run finished successfully. Run directory: {run_dir}")
     return 0
@@ -486,6 +544,8 @@ def main() -> int:
     args = parse_args()
     project_root = Path(args.project_root).resolve()
     paths, model_cfg, solver_cfg, dataset = load_configs(project_root, args.dataset)
+    apply_profile_defaults(args, load_run_profile(project_root, "monolithic", dataset))
+    args._run_profile = f"monolithic.{dataset}"
     sensitivity_overrides = apply_sensitivity_overrides(model_cfg, args)
     args._sensitivity_overrides = sensitivity_overrides
     sensitivity_suffix = make_sensitivity_suffix(args, sensitivity_overrides)
@@ -496,6 +556,33 @@ def main() -> int:
         solver_cfg["time_limit_seconds"] = int(args.time_limit)
     if args.mip_gap is not None:
         solver_cfg["mip_gap"] = float(args.mip_gap)
+
+    method_map = {
+        "auto": None,
+        "primal": 0,
+        "dual": 1,
+        "barrier": 2,
+        "concurrent": 3,
+        "deterministic-concurrent": 4,
+    }
+    node_method_map = {"auto": None, "primal": 0, "dual": 1, "barrier": 2}
+
+    if method_map[args.root_method] is not None:
+        solver_cfg["method"] = method_map[args.root_method]
+    if node_method_map[args.node_method] is not None:
+        solver_cfg["node_method"] = node_method_map[args.node_method]
+    if args.nodefile_start is not None:
+        solver_cfg["nodefile_start_gb"] = float(args.nodefile_start)
+    if args.soft_mem_limit_gb is not None:
+        solver_cfg["soft_mem_limit_gb"] = float(args.soft_mem_limit_gb)
+    if args.pre_sparsify is not None:
+        solver_cfg["pre_sparsify"] = int(args.pre_sparsify)
+    if args.aggregate is not None:
+        solver_cfg["aggregate"] = int(args.aggregate)
+    if args.pre_passes is not None:
+        solver_cfg["pre_passes"] = int(args.pre_passes)
+    if args.solver_cuts is not None:
+        solver_cfg["cuts"] = int(args.solver_cuts)
 
     if args.smoke:
         return run_smoke(project_root, paths)

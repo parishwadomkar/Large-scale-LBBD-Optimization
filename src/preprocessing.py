@@ -178,10 +178,15 @@ def preprocess(raw: dict, cfg: dict) -> dict:
             d_pub[(i, t)] += et
 
     home_kwh_per_slot = float(charger_capacity["home"])
+    home_demand_total_event = dict(d_home)
+    home_private_served_event = {}
     for i in hex_ids:
         cap_i = float(home_avail[i]) * home_kwh_per_slot
         for t in time_indices:
-            d_home[(i, t)] = max(d_home[(i, t)] - cap_i, 0.0)
+            raw_home = float(home_demand_total_event[(i, t)])
+            private_served = min(raw_home, cap_i)
+            home_private_served_event[(i, t)] = private_served
+            d_home[(i, t)] = max(raw_home - private_served, 0.0)
 
     demand_event = {}
     for i in hex_ids:
@@ -250,6 +255,8 @@ def preprocess(raw: dict, cfg: dict) -> dict:
         "time_indices": time_indices,
         "cl": cl,
         "home_avail": home_avail,
+        "home_demand_total_event": home_demand_total_event,
+        "home_private_served_event": home_private_served_event,
         "demand_event": demand_event,
         "demand_event_annual": demand_event_annual,
         "allowed": sorted(allowed),
