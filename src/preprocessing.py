@@ -134,7 +134,7 @@ def preprocess(raw: dict, cfg: dict) -> dict:
     charger_capacity = cfg["charger_capacity_kwh_per_slot"]
     charger_capacity_pub = {c: float(charger_capacity[c]) for c in PUB_TYPES}
     charger_price = {c: float(cfg["charger_price_sek_per_kwh"][c]) for c in PUB_TYPES}
-    charger_footprint = {c: float(cfg["charger_footprint"][c]) for c in PUB_TYPES}
+    charger_resources = {c: float(cfg["charger_resources"][c]) for c in PUB_TYPES}
     eligible = {"home": PUB_TYPES[:], "public": PUB_TYPES[:]}
     delta_price = {(co, cd): max(0.0, charger_price[cd] - charger_price[co]) for co in PUB_TYPES for cd in PUB_TYPES}
 
@@ -240,8 +240,8 @@ def preprocess(raw: dict, cfg: dict) -> dict:
     prev_month = {MONTHS[i]: MONTHS[i - 1] if i > 0 else MONTHS[-1] for i in range(len(MONTHS))}
     k_batt = float(cfg["battery_cell_cap_kwh"]) / (float(cfg["battery_duration_h"]) * float(cfg["rho_half_hours_per_hour"]))
     m_batt = {int(i): k_batt * int(cfg["battery_max_units_per_hex"]) for i in hex_ids}
-    max_k_per_footprint = max(charger_capacity_pub[c] / charger_footprint[c] for c in PUB_TYPES)
-    m_redir = {int(j): float(max_k_per_footprint * cl[int(j)]) for j in hex_ids}
+    max_k_per_resource = max(charger_capacity_pub[c] / charger_resources[c] for c in PUB_TYPES)
+    m_redir = {int(j): float(max_k_per_resource * cl[int(j)]) for j in hex_ids}
 
     return {
         "MONTHS": MONTHS,
@@ -276,7 +276,7 @@ def preprocess(raw: dict, cfg: dict) -> dict:
         "charger_capacity_pub": charger_capacity_pub,
         "charger_capacity": charger_capacity,
         "charger_price": charger_price,
-        "charger_footprint": charger_footprint,
+        "charger_resources": charger_resources,
         "delta_price": delta_price,
         "eligible": eligible,
         "prev_month": prev_month,

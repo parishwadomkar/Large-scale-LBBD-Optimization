@@ -8,14 +8,14 @@ __pycache__/
 venv/
 .env
 
-!logs/.gitkeep
+# Solver scratch / transient files
 *.lp
 *.mps
 *.mst
 *.sol
 *.log
+runs/**/nodefiles/
+runs/gurobi_nodefiles/
 
 .ipynb_checkpoints/
 *.zip
-runs
-runs/

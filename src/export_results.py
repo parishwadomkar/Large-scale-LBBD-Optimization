@@ -132,11 +132,11 @@ def export_infrastructure(model, data: dict, results_dir: Path) -> pd.DataFrame:
         row = {"HexID": int(i)}
         for c in model.C_pub:
             row[f"{c}_chargers"] = sv(model.x[i, c])
-            row[f"{c}_footprint"] = sv(model.Footprint[c]) * sv(model.x[i, c])
+            row[f"{c}_resources_used"] = sv(model.Resource[c]) * sv(model.x[i, c])
             row[f"{c}_capacity_kWh_slot"] = sv(model.K[c]) * sv(model.x[i, c])
         row["PV_panels"] = sv(model.PV[i])
         row["Battery_units"] = sv(model.Batt[i])
-        row["Total_charger_footprint"] = sum(sv(model.Footprint[c]) * sv(model.x[i, c]) for c in model.C_pub)
+        row["Total_charger_resources_used"] = sum(sv(model.Resource[c]) * sv(model.x[i, c]) for c in model.C_pub)
         row["Total_public_capacity_kWh_slot"] = sum(sv(model.K[c]) * sv(model.x[i, c]) for c in model.C_pub)
         rows.append(row)
     df = pd.DataFrame(rows).sort_values("HexID")
@@ -428,7 +428,7 @@ def export_redirection_capacity_diagnostics(model, data: dict, results_dir: Path
         in_ann = sum(data["N_MONTH"][mon] * sv(model.z[j, i, mon, t]) for mon in model.M for t in model.H for j in IN.get((i, mon, t), []))
         slack_ann = sum(data["N_MONTH"][mon] * sv(model.slack[i, mon, t, b]) for mon in model.M for t in model.H for b in model.B)
         public_demand_ann = sum(data["N_MONTH"][mon] * sv(model.Demand[i, mon, t, "public"]) for mon in model.M for t in model.H)
-        footprint_used = sum(sv(model.Footprint[c]) * sv(model.x[i, c]) for c in model.C_pub)
+        resource_used = sum(sv(model.Resource[c]) * sv(model.x[i, c]) for c in model.C_pub)
         capacity_slot = sum(sv(model.K[c]) * sv(model.x[i, c]) for c in model.C_pub)
         rows.append({
             "HexID": int(i),
@@ -437,9 +437,9 @@ def export_redirection_capacity_diagnostics(model, data: dict, results_dir: Path
             "AnnualRedirectionOut_kWh": out_ann,
             "AnnualRedirectionIn_kWh": in_ann,
             "NetRedirectionIn_kWh": in_ann - out_ann,
-            "ChargerFootprintUsed": footprint_used,
-            "ParkingFootprintLimit": sv(model.CL[i]),
-            "FootprintBinding": abs(footprint_used - sv(model.CL[i])) <= 1e-5,
+            "ChargerResourcesUsed": resource_used,
+            "AvailableResourceLimit": sv(model.CL[i]),
+            "ResourceBinding": abs(resource_used - sv(model.CL[i])) <= 1e-5,
             "InstalledCapacity_kWh_slot": capacity_slot,
         })
     df = pd.DataFrame(rows).sort_values(["AnnualSlack_kWh", "AnnualPublicDemand_kWh"], ascending=[False, False])

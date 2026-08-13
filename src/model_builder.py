@@ -18,7 +18,7 @@ from pyomo.environ import (
 
 
 def build_model(data: dict, cfg: dict):
-    """Build the June-14 type-aware EV CPO MILP from the uploaded notebook."""
+    """Build the type-aware EV charging infrastructure MILP."""
     model = ConcreteModel()
 
     I = data["hex_ids"]
@@ -45,7 +45,7 @@ def build_model(data: dict, cfg: dict):
     model.DeltaPrice = Param(model.C_pub, model.C_pub, initialize=data["delta_price"], within=NonNegativeReals)
     model.Demand = Param(model.I, model.M, model.H, model.B, initialize=data["demand_event_annual"], within=NonNegativeReals)
     model.K = Param(model.C_pub, initialize=data["charger_capacity_pub"])
-    model.Footprint = Param(model.C_pub, initialize=data["charger_footprint"])
+    model.Resource = Param(model.C_pub, initialize=data["charger_resources"])
     model.PVF_cost = Param(model.C_pub, initialize=lambda m, c: data["daily_cost"][c])
     model.PVF_PV = Param(initialize=data["daily_cost"]["PV"])
     model.PVF_Batt = Param(initialize=data["daily_cost"]["Batt"])
@@ -70,7 +70,7 @@ def build_model(data: dict, cfg: dict):
     model.Ndays = Param(model.M, initialize=lambda m, mon: data["N_MONTH"][mon])
 
     def x_bounds(m, i, c):
-        return (0, int(math.floor(data["cl"][int(i)] / data["charger_footprint"][c])))
+        return (0, int(math.floor(data["cl"][int(i)] / data["charger_resources"][c])))
 
     def pv_bounds(m, i):
         return (0, data["pv_upper"][int(i)])
@@ -128,9 +128,9 @@ def build_model(data: dict, cfg: dict):
     model.RedirCapBinary = Constraint(model.A, rule=redir_cap_binary_rule)
 
     def pub_limit(m, i):
-        return quicksum(m.Footprint[c] * m.x[i, c] for c in m.C_pub) <= m.CL[i]
+        return quicksum(m.Resource[c] * m.x[i, c] for c in m.C_pub) <= m.CL[i]
 
-    model.PublicLimit = Constraint(model.I, rule=pub_limit)
+    model.ResourceLimit = Constraint(model.I, rule=pub_limit)
 
     def demand_cover_rule(m, i, mon, t, b):
         served = quicksum(m.edisp[i, mon, t, c, b] for c in eligible[b])

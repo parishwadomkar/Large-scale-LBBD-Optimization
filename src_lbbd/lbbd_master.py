@@ -38,7 +38,7 @@ class AnnualLPDualCut:
 
 def _x_upper_bounds(data: dict) -> dict[tuple[int, str], int]:
     return {
-        (int(i), str(c)): int(math.floor(float(data["cl"][int(i)]) / float(data["charger_footprint"][str(c)])))
+        (int(i), str(c)): int(math.floor(float(data["cl"][int(i)]) / float(data["charger_resources"][str(c)])))
         for i in data["hex_ids"] for c in data["PUB_TYPES"]
     }
 
@@ -130,7 +130,7 @@ def build_lbbd_master(data: dict, cfg: dict, slot_components: dict, global_compo
     batt_ub = {int(i): (0 if data.get("disable_bess", False) else int(cfg["battery_max_units_per_hex"])) for i in data["hex_ids"]}
 
     model.K = pyo.Param(model.C, initialize={str(c): float(data["charger_capacity_pub"][str(c)]) for c in data["PUB_TYPES"]})
-    model.Footprint = pyo.Param(model.C, initialize={str(c): float(data["charger_footprint"][str(c)]) for c in data["PUB_TYPES"]})
+    model.Resource = pyo.Param(model.C, initialize={str(c): float(data["charger_resources"][str(c)]) for c in data["PUB_TYPES"]})
     model.Price = pyo.Param(model.C, initialize={str(c): float(data["charger_price"][str(c)]) for c in data["PUB_TYPES"]})
     model.CL = pyo.Param(model.I, initialize={int(i): float(data["cl"][int(i)]) for i in data["hex_ids"]})
     model.Days = pyo.Param(initialize=float(data["DAYS"]))
@@ -196,9 +196,9 @@ def build_lbbd_master(data: dict, cfg: dict, slot_components: dict, global_compo
     model.XBitLink = pyo.Constraint(model.I, model.C, rule=x_link)
     model.PVBitLink = pyo.Constraint(model.I, rule=pv_link)
     model.BattBitLink = pyo.Constraint(model.I, rule=batt_link)
-    model.FootprintLimit = pyo.Constraint(
+    model.ResourceLimit = pyo.Constraint(
         model.I,
-        rule=lambda m, i: pyo.quicksum(m.Footprint[c] * m.x[i, c] for c in m.C) <= m.CL[i],
+        rule=lambda m, i: pyo.quicksum(m.Resource[c] * m.x[i, c] for c in m.C) <= m.CL[i],
     )
 
     component_demand: dict[tuple[str, int, int], float] = {}

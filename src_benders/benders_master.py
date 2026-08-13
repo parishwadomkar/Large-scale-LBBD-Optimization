@@ -23,7 +23,7 @@ def build_benders_master(data: dict, cfg: dict, scenario: str = "with_redirectio
     m.DeltaPrice = pyo.Param(m.C_pub, m.C_pub, initialize=data["delta_price"], within=pyo.NonNegativeReals)
     m.Demand = pyo.Param(m.I, m.M, m.H, m.B, initialize=data["demand_event_annual"], within=pyo.NonNegativeReals)
     m.K = pyo.Param(m.C_pub, initialize=data["charger_capacity_pub"])
-    m.Footprint = pyo.Param(m.C_pub, initialize=data["charger_footprint"])
+    m.Resource = pyo.Param(m.C_pub, initialize=data["charger_resources"])
     m.PVF_cost = pyo.Param(m.C_pub, initialize=lambda mm, c: data["daily_cost"][c])
     m.PVF_PV = pyo.Param(initialize=data["daily_cost"]["PV"])
     m.PVF_Batt = pyo.Param(initialize=data["daily_cost"]["Batt"])
@@ -47,7 +47,7 @@ def build_benders_master(data: dict, cfg: dict, scenario: str = "with_redirectio
     m.Ndays = pyo.Param(m.M, initialize=lambda mm, mon: data["N_MONTH"][mon])
 
     def x_bounds(mm, i, c):
-        return (0, int(math.floor(data["cl"][int(i)] / data["charger_footprint"][c])))
+        return (0, int(math.floor(data["cl"][int(i)] / data["charger_resources"][c])))
     def pv_bounds(mm, i):
         return (0, data["pv_upper"][int(i)])
     def batt_bounds(mm, i):
@@ -80,7 +80,7 @@ def build_benders_master(data: dict, cfg: dict, scenario: str = "with_redirectio
     redir_min = float(cfg["redir_min_kwh"])
 
     m.SiteUtil = pyo.Constraint(m.I, m.M, m.H, m.C_pub, rule=lambda mm, i, mon, t, c: pyo.quicksum(mm.edisp[i, mon, t, c, b] for b in mm.B) <= mm.K[c] * mm.x[i, c])
-    m.PublicLimit = pyo.Constraint(m.I, rule=lambda mm, i: pyo.quicksum(mm.Footprint[c] * mm.x[i, c] for c in mm.C_pub) <= mm.CL[i])
+    m.ResourceLimit = pyo.Constraint(m.I, rule=lambda mm, i: pyo.quicksum(mm.Resource[c] * mm.x[i, c] for c in mm.C_pub) <= mm.CL[i])
 
     def demand_cover(mm, i, mon, t, b):
         served = pyo.quicksum(mm.edisp[i, mon, t, c, b] for c in eligible[b])

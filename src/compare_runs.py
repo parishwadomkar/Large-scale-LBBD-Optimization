@@ -126,8 +126,6 @@ def _active_redirection_arcs(run_dir: Path) -> float:
 
 
 def _load_capacity_config(project_root: Path) -> dict[str, float]:
-    import json
-
     path = project_root / "config" / "model_config.json"
     cfg = json.loads(path.read_text(encoding="utf-8"))
     return {str(k): float(v) for k, v in cfg["charger_capacity_kwh_per_slot"].items()}

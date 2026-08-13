@@ -6,3 +6,9 @@ geopandas
 networkx
 openpyxl
 psutil
+matplotlib
+contextily
+shapely
+pyproj
+pyogrio
+fiona

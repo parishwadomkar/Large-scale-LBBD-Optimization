@@ -107,6 +107,27 @@ Three-way comparison after the runs finish:
 python src\compare_runs.py --monolithic-run "runs\<MONOLITHIC_RUN_FOLDER>" --benders-run "runs\<BENDERS_RUN_FOLDER>" --lbbd-run "runs\<LBBD_RUN_FOLDER>"
 ```
 
+Same-method comparison across different scenarios:
+
+```powershell
+python src\compare_scenarios.py --method lbbd --run "runs\<SCENARIO_RUN_1>" --run "runs\<SCENARIO_RUN_2>" --run "runs\<SCENARIO_RUN_3>"
+```
+
+`--method` accepts `monolithic`, `benders`, or `lbbd`. The first supplied run is used as the baseline by default. Custom labels and a different baseline can be supplied when needed:
+
+```powershell
+python src\compare_scenarios.py `
+  --method lbbd `
+  --run "runs\<SCENARIO_RUN_1>" `
+  --run "runs\<SCENARIO_RUN_2>" `
+  --label "PV + BESS, no redirection" `
+  --label "PV + BESS, with redirection" `
+  --baseline-index 1
+```
+
+The same-method comparison writes a formatted workbook under `runs/comparisons/` containing scenario summaries, changes relative to the baseline, redirection effects, scenario ranking, computational summaries, run metadata, raw metrics, and consistency checks. It is independent of `compare_runs.py`, which remains the comparator for monolithic–Benders–LBBD runs.
+
+
 Common scenario and technology switches:
 
 | Option | Values / usage | Effect |
@@ -204,6 +225,7 @@ For issues, feature requests, or reproducibility questions, please open a GitHub
 ### Demand simulation source
 
 Charging-demand inputs are based on the MATSim-driven simulation framework [`UrbanEV-v2`](https://github.com/parishwadomkar/UrbanEV-v2).
+
 
 Published demand-modeling article:
 

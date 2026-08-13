@@ -17,3 +17,5 @@ Example:
 No previous run folder or external infrastructure solution is read.
 
 Figures are generated automatically after a successful result export. Use `--skip-figures` only when post-processing should be disabled.
+
+Same-method scenario comparisons are generated with the shared `scripts\10_compare_scenario_runs.bat` utility using `benders` as the method argument.
