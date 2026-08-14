@@ -13,12 +13,12 @@ jobs:
       contents: write
       
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
       with:
         fetch-depth: 0
     
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.9'
     
@@ -63,9 +63,17 @@ jobs:
         try:
             # Get views
             views = repo.get_views_traffic()
-            traffic_data['views'] = [
-                {'timestamp': v.timestamp.isoformat(), 'count': v.count, 'uniques': v.uniques}
-                for v in views['views']
+            view_records = getattr(views, "views", None)
+            if view_records is None:
+                view_records = views["views"]
+            
+            traffic_data["views"] = [
+                {
+                    "timestamp": v.timestamp.isoformat(),
+                    "count": v.count,
+                    "uniques": v.uniques,
+                }
+                for v in view_records
             ]
             print(f"✓ Fetched {len(traffic_data['views'])} view records")
         except Exception as e:
@@ -74,9 +82,17 @@ jobs:
         try:
             # Get clones
             clones = repo.get_clones_traffic()
-            traffic_data['clones'] = [
-                {'timestamp': c.timestamp.isoformat(), 'count': c.count, 'uniques': c.uniques}
-                for c in clones['clones']
+            clone_records = getattr(clones, "clones", None)
+            if clone_records is None:
+                clone_records = clones["clones"]
+            
+            traffic_data["clones"] = [
+                {
+                    "timestamp": c.timestamp.isoformat(),
+                    "count": c.count,
+                    "uniques": c.uniques,
+                }
+                for c in clone_records
             ]
             print(f"✓ Fetched {len(traffic_data['clones'])} clone records")
         except Exception as e:
