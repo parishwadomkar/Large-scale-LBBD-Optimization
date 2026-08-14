@@ -119,10 +119,12 @@ jobs:
                 summaries = json.load(f)
         
         summaries[date_str] = {
-            'views_count': len(traffic_data['views']),
-            'clones_count': len(traffic_data['clones']),
-            'popular_paths_count': len(traffic_data['popular_paths']),
-            'popular_referrers_count': len(traffic_data['popular_referrers'])
+            "total_views": sum(v["count"] for v in traffic_data["views"]),
+            "unique_visitors": sum(v["uniques"] for v in traffic_data["views"]),
+            "total_clones": sum(c["count"] for c in traffic_data["clones"]),
+            "unique_cloners": sum(c["uniques"] for c in traffic_data["clones"]),
+            "top_paths": traffic_data["popular_paths"][:10],
+            "top_referrers": traffic_data["popular_referrers"][:10]
         }
         
         with open(summary_file, 'w') as f:
