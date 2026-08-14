@@ -40,7 +40,7 @@ jobs:
         
         # Initialize GitHub client
         g = Github(os.environ.get('GITHUB_TOKEN'))
-        repo = g.get_repo()
+        repo = g.get_repo(os.environ["GITHUB_REPOSITORY"])
         
         # Create archive directory if it doesn't exist
         archive_dir = Path('traffic-data')
