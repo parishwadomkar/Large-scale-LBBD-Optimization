@@ -2,163 +2,163 @@ name: Traffic Archive
 
 on:
   schedule:
-    # Run daily at 00:00 UTC
     - cron: '0 0 * * *'
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   archive-traffic:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      
+
     steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-    
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.9'
-    
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install requests PyGithub
-    
-    - name: Archive traffic data
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        python - <<'EOF'
-        import os
-        import json
-        from datetime import datetime
-        from pathlib import Path
-        from github import Github
-        
-        # Initialize GitHub client
-        g = Github(os.environ.get('GITHUB_TOKEN'))
-        repo = g.get_repo(os.environ["GITHUB_REPOSITORY"])
-        
-        # Create archive directory if it doesn't exist
-        archive_dir = Path('traffic-data')
-        archive_dir.mkdir(exist_ok=True)
-        
-        # Get current timestamp
-        timestamp = datetime.now().isoformat()
-        date_str = datetime.now().strftime('%Y-%m-%d')
-        
-        # Fetch traffic data
-        traffic_data = {
-            'timestamp': timestamp,
-            'date': date_str,
-            'views': [],
-            'clones': [],
-            'popular_paths': [],
-            'popular_referrers': []
-        }
-        
-        try:
-            # Get views
-            views = repo.get_views_traffic()
-            view_records = getattr(views, "views", None)
-            if view_records is None:
-                view_records = views["views"]
-            
-            traffic_data["views"] = [
-                {
-                    "timestamp": v.timestamp.isoformat(),
-                    "count": v.count,
-                    "uniques": v.uniques,
-                }
-                for v in view_records
-            ]
-            print(f"✓ Fetched {len(traffic_data['views'])} view records")
-        except Exception as e:
-            print(f"⚠ Could not fetch views: {e}")
-        
-        try:
-            # Get clones
-            clones = repo.get_clones_traffic()
-            clone_records = getattr(clones, "clones", None)
-            if clone_records is None:
-                clone_records = clones["clones"]
-            
-            traffic_data["clones"] = [
-                {
-                    "timestamp": c.timestamp.isoformat(),
-                    "count": c.count,
-                    "uniques": c.uniques,
-                }
-                for c in clone_records
-            ]
-            print(f"✓ Fetched {len(traffic_data['clones'])} clone records")
-        except Exception as e:
-            print(f"⚠ Could not fetch clones: {e}")
-        
-        try:
-            # Get popular paths
-            paths = repo.get_top_paths()
-            traffic_data['popular_paths'] = [
-                {'path': p.path, 'count': p.count, 'uniques': p.uniques}
-                for p in paths
-            ]
-            print(f"✓ Fetched {len(traffic_data['popular_paths'])} popular paths")
-        except Exception as e:
-            print(f"⚠ Could not fetch popular paths: {e}")
-        
-        try:
-            # Get popular referrers
-            referrers = repo.get_top_referrers()
-            traffic_data['popular_referrers'] = [
-                {'referrer': r.referrer, 'count': r.count, 'uniques': r.uniques}
-                for r in referrers
-            ]
-            print(f"✓ Fetched {len(traffic_data['popular_referrers'])} popular referrers")
-        except Exception as e:
-            print(f"⚠ Could not fetch popular referrers: {e}")
-        
-        # Save data with timestamp
-        output_file = archive_dir / f'traffic-{date_str}.json'
-        with open(output_file, 'w') as f:
-            json.dump(traffic_data, f, indent=2)
-        
-        print(f"\n✓ Traffic data archived to {output_file}")
-        
-        # Also maintain a summary file
-        summary_file = archive_dir / 'traffic-summary.json'
-        summaries = {}
-        if summary_file.exists():
-            with open(summary_file, 'r') as f:
-                summaries = json.load(f)
-        
-        summaries[date_str] = {
-            "total_views": sum(v["count"] for v in traffic_data["views"]),
-            "unique_visitors": sum(v["uniques"] for v in traffic_data["views"]),
-            "total_clones": sum(c["count"] for c in traffic_data["clones"]),
-            "unique_cloners": sum(c["uniques"] for c in traffic_data["clones"]),
-            "top_paths": traffic_data["popular_paths"][:10],
-            "top_referrers": traffic_data["popular_referrers"][:10]
-        }
-        
-        with open(summary_file, 'w') as f:
-            json.dump(summaries, f, indent=2)
-        
-        print(f"✓ Updated traffic summary")
-        EOF
-    
-    - name: Commit and push changes
-      run: |
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-        
-        if [ -n "$(git status --porcelain)" ]; then
-          git add traffic-data/
-          git commit -m "chore: archive traffic data - $(date -u +'%Y-%m-%d')"
-          git push
-          echo "✓ Changes committed and pushed"
-        else
-          echo "✓ No changes to commit"
-        fi
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyGithub
+
+      - name: Archive traffic data
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python - <<'EOF'
+          import os
+          import json
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from github import Github
+
+          g = Github(os.environ["GITHUB_TOKEN"])
+          repo = g.get_repo(os.environ["GITHUB_REPOSITORY"])
+
+          archive_dir = Path("traffic-data")
+          archive_dir.mkdir(exist_ok=True)
+
+          now = datetime.now(timezone.utc)
+          timestamp = now.isoformat()
+          date_str = now.strftime("%Y-%m-%d")
+
+          traffic_data = {
+              "timestamp_utc": timestamp,
+              "date_utc": date_str,
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "views": [],
+              "clones": [],
+              "popular_paths": [],
+              "popular_referrers": [],
+          }
+
+          def object_or_dict_list(obj, attr, key):
+              value = getattr(obj, attr, None)
+              if value is not None:
+                  return value
+              return obj[key]
+
+          try:
+              views = repo.get_views_traffic(per="day")
+              view_records = object_or_dict_list(views, "views", "views")
+              traffic_data["views"] = [
+                  {
+                      "timestamp": v.timestamp.isoformat(),
+                      "count": v.count,
+                      "uniques": v.uniques,
+                  }
+                  for v in view_records
+              ]
+              print(f"Fetched {len(traffic_data['views'])} view records")
+          except Exception as e:
+              print(f"Could not fetch views: {e}")
+
+          try:
+              clones = repo.get_clones_traffic(per="day")
+              clone_records = object_or_dict_list(clones, "clones", "clones")
+              traffic_data["clones"] = [
+                  {
+                      "timestamp": c.timestamp.isoformat(),
+                      "count": c.count,
+                      "uniques": c.uniques,
+                  }
+                  for c in clone_records
+              ]
+              print(f"Fetched {len(traffic_data['clones'])} clone records")
+          except Exception as e:
+              print(f"Could not fetch clones: {e}")
+
+          try:
+              paths = repo.get_top_paths() or []
+              traffic_data["popular_paths"] = [
+                  {
+                      "path": p.path,
+                      "title": getattr(p, "title", None),
+                      "count": p.count,
+                      "uniques": p.uniques,
+                  }
+                  for p in paths
+              ]
+              print(f"Fetched {len(traffic_data['popular_paths'])} popular paths")
+          except Exception as e:
+              print(f"Could not fetch popular paths: {e}")
+
+          try:
+              referrers = repo.get_top_referrers() or []
+              traffic_data["popular_referrers"] = [
+                  {
+                      "referrer": r.referrer,
+                      "count": r.count,
+                      "uniques": r.uniques,
+                  }
+                  for r in referrers
+              ]
+              print(f"Fetched {len(traffic_data['popular_referrers'])} popular referrers")
+          except Exception as e:
+              print(f"Could not fetch popular referrers: {e}")
+
+          output_file = archive_dir / f"traffic-{date_str}.json"
+          with open(output_file, "w", encoding="utf-8") as f:
+              json.dump(traffic_data, f, indent=2)
+
+          summary_file = archive_dir / "traffic-summary.json"
+          summaries = {}
+          if summary_file.exists():
+              with open(summary_file, "r", encoding="utf-8") as f:
+                  summaries = json.load(f)
+
+          summaries[date_str] = {
+              "timestamp_utc": timestamp,
+              "total_views": sum(v["count"] for v in traffic_data["views"]),
+              "unique_visitors": sum(v["uniques"] for v in traffic_data["views"]),
+              "total_clones": sum(c["count"] for c in traffic_data["clones"]),
+              "unique_cloners": sum(c["uniques"] for c in traffic_data["clones"]),
+              "top_paths": traffic_data["popular_paths"][:10],
+              "top_referrers": traffic_data["popular_referrers"][:10],
+          }
+
+          with open(summary_file, "w", encoding="utf-8") as f:
+              json.dump(summaries, f, indent=2)
+
+          print(f"Traffic data archived to {output_file}")
+          EOF
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if [ -n "$(git status --porcelain)" ]; then
+            git add traffic-data/
+            git commit -m "chore: archive traffic data - $(date -u +'%Y-%m-%d')"
+            git push
+            echo "Changes committed and pushed"
+          else
+            echo "No changes to commit"
+          fi
