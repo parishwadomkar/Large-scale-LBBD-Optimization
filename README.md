@@ -42,6 +42,7 @@ Run settings are read from `config/model_config.json`, `config/solver_gurobi.jso
 
 ## Input data
 
+The input data is publicly available in the [`data/`](https://github.com/parishwadomkar/Large-scale-LBBD-Optimization/tree/main/data) directory.
 A typical `config/paths.json` points to the small and full datasets under `data/raw/small/` and `data/raw/full/`:
 
 ```text
@@ -88,6 +89,7 @@ Small Benders run:
 ```powershell
 python src_benders\run_benders.py --dataset small --scenario with_redirection --threads 12 --mip-gap 0.0001
 ```
+The implemented Benders decomposition workflow is explained in [`src_benders/README.md`](https://github.com/parishwadomkar/Large-scale-LBBD-Optimization/blob/main/src_benders/README.md).
 
 Small LBBD run:
 
@@ -100,12 +102,15 @@ Full LBBD run (memory-stable 256 GB workstation/HPC profile):
 ```powershell
 python src_lbbd\run_lbbd.py --dataset full --scenario with_redirection --threads 10 --soft-mem-limit-gb 180 --nodefile-start 0.5 --nodefile-dir "runs\gurobi_nodefiles"
 ```
+The run outputs for the [monolithic](https://github.com/parishwadomkar/Large-scale-LBBD-Optimization/tree/main/runs/2026-08-12_093933_small_with_redirection_withPV_withBESS_slackpenalty), [Benders](https://github.com/parishwadomkar/Large-scale-LBBD-Optimization/tree/main/runs/2026-08-12_095839_small_with_redirection_Benders_withPV_withBESS), and [LBBD](https://github.com/parishwadomkar/Large-scale-LBBD-Optimization/tree/main/runs/2026-08-12_184349_small_with_redirection_LBBD_withPV_withBESS) workflows are available in the [`runs/`](https://github.com/parishwadomkar/Large-scale-LBBD-Optimization/tree/main/runs) directory.
+
 
 Three-way comparison after the runs finish:
 
 ```powershell
 python src\compare_runs.py --monolithic-run "runs\<MONOLITHIC_RUN_FOLDER>" --benders-run "runs\<BENDERS_RUN_FOLDER>" --lbbd-run "runs\<LBBD_RUN_FOLDER>"
 ```
+The results from the three implemented methods are comparable and can be validated using the [`monolithic_benders_lbbd_comparison.xlsx`](https://github.com/parishwadomkar/Large-scale-LBBD-Optimization/blob/main/runs/comparisons/2026-08-12_210707_monolithic_benders_lbbd_comparison.xlsx) workbook.
 
 Same-method comparison across different scenarios:
 
@@ -113,7 +118,7 @@ Same-method comparison across different scenarios:
 python src\compare_scenarios.py --method lbbd --run "runs\<SCENARIO_RUN_1>" --run "runs\<SCENARIO_RUN_2>" --run "runs\<SCENARIO_RUN_3>"
 ```
 
-`--method` accepts `monolithic`, `benders`, or `lbbd`. The first supplied run is used as the baseline by default. Custom labels and a different baseline can be supplied when needed:
+`--method` accepts `monolithic`, `benders`, or `lbbd`. The first supplied run is used as the baseline by default. Custom labels and a different baseline can be supplied when needed.
 
 ```powershell
 python src\compare_scenarios.py `
@@ -188,8 +193,9 @@ Each run writes a timestamped folder under `runs/`. The main outputs are stored 
 | `figures/figures_manifest.csv` | List of generated and skipped figures. |
 
 LBBD runs additionally export `results/lbbd_history.csv`, bound summaries, cut diagnostics, candidate-cache diagnostics, and decomposition figures. Benders runs export corresponding iteration and cut-history files. The comparison command writes a formatted Excel workbook under `runs/comparisons/` with economic, infrastructure, energy, redirection, and computational-efficiency comparisons across the three workflows.
+Figures generated automatically from the LBBD run are available in the LBBD [`figures/`](https://github.com/parishwadomkar/Large-scale-LBBD-Optimization/tree/main/runs/2026-08-12_184349_small_with_redirection_LBBD_withPV_withBESS/figures) and, similarly, in other method run output directories.
 
-Figures are generated automatically after a successful run. They can also be regenerated for an existing run.
+
 ---
 
 ## Reproducibility notes
