@@ -220,7 +220,7 @@ For issues, feature requests, or reproducibility questions, please open a GitHub
 
 ### Charging infrastructure optimization
 
-**Parishwad, Omkar; Najafi, Arsalan; Gao, Kun** — *Joint Optimization of Charging Infrastructure and Renewable Energies with Battery Storage Considering User Redirection Incentives.*
+**Parishwad, Omkar; Najafi, Arsalan; Gao, Kun** — *User redirection-aware co-optimization of public charging with local photovoltaics and battery storage.*
 
 ### Demand simulation source
 
