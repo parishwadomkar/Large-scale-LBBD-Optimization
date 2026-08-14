@@ -97,7 +97,7 @@ Small LBBD run:
 python src_lbbd\run_lbbd.py --dataset small --scenario with_redirection --threads 12 --mip-gap 0.0001
 ```
 
-Full LBBD run (memory-stable 256 GB workstation/HPC profile):
+Full LBBD run (memory-stable workstation/HPC profile):
 
 ```powershell
 python src_lbbd\run_lbbd.py --dataset full --scenario with_redirection --threads 10 --soft-mem-limit-gb 180 --nodefile-start 0.5 --nodefile-dir "runs\gurobi_nodefiles"
