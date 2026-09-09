@@ -95,6 +95,11 @@ def parse_args() -> argparse.Namespace:
         help="GB of branch-and-bound node memory before nodes are compressed to disk."
     )
     parser.add_argument(
+        "--nodefile-dir",
+        default=None,
+        help="Optional directory for Gurobi branch-and-bound node files."
+    )
+    parser.add_argument(
         "--soft-mem-limit-gb",
         type=float,
         default=None,
@@ -533,7 +538,13 @@ def _run_optimization_impl(
         phase_timing=phase_timing,
         model_stats={"main_model": main_model_stats},
         resource_monitor=monitor,
-        extra_scalars={"solver_mip_gap_requested": solver_cfg.get("mip_gap")},
+        extra_scalars={
+            "solver_mip_gap_requested": solver_cfg.get("mip_gap"),
+            "solver_threads_requested": solver_cfg.get("threads"),
+            "nodefile_start_gb": solver_cfg.get("nodefile_start_gb"),
+            "nodefile_dir": solver_cfg.get("nodefile_dir"),
+            "soft_mem_limit_gb": solver_cfg.get("soft_mem_limit_gb"),
+        },
     )
 
     print(f"Run finished successfully. Run directory: {run_dir}")
@@ -573,6 +584,8 @@ def main() -> int:
         solver_cfg["node_method"] = node_method_map[args.node_method]
     if args.nodefile_start is not None:
         solver_cfg["nodefile_start_gb"] = float(args.nodefile_start)
+    if args.nodefile_dir is not None:
+        solver_cfg["nodefile_dir"] = str(args.nodefile_dir)
     if args.soft_mem_limit_gb is not None:
         solver_cfg["soft_mem_limit_gb"] = float(args.soft_mem_limit_gb)
     if args.pre_sparsify is not None:

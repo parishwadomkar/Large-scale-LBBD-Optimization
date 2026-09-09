@@ -104,6 +104,8 @@ def _select_corepoint_dual(
     opt.options["Threads"] = max(1, min(int(solver_cfg.get("threads", 1)), 2))
     opt.options["Presolve"] = int(solver_cfg.get("presolve", 2))
     opt.options["NumericFocus"] = int(solver_cfg.get("numeric_focus", 2))
+    if solver_cfg.get("soft_mem_limit_gb") is not None:
+        opt.options["SoftMemLimit"] = float(solver_cfg["soft_mem_limit_gb"])
     opt.options["OutputFlag"] = 0
     opt.options["TimeLimit"] = max(30, min(int(solver_cfg.get("time_limit_seconds", 300)), 900))
     if run_dir is not None:
@@ -186,6 +188,8 @@ def solve_type_assignment_lp(
     opt.options["Threads"] = max(1, min(int(solver_cfg.get("threads", 1)), 2))
     opt.options["Presolve"] = int(solver_cfg.get("presolve", 2))
     opt.options["NumericFocus"] = int(solver_cfg.get("numeric_focus", 2))
+    if solver_cfg.get("soft_mem_limit_gb") is not None:
+        opt.options["SoftMemLimit"] = float(solver_cfg["soft_mem_limit_gb"])
     opt.options["Method"] = 1
     opt.options["OutputFlag"] = 0
     opt.options["TimeLimit"] = max(30, min(int(solver_cfg.get("time_limit_seconds", 300)), 900))

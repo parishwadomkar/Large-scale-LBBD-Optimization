@@ -447,11 +447,36 @@ def export_redirection_capacity_diagnostics(model, data: dict, results_dir: Path
     return df
 
 def write_combined_xlsx(results_dir: Path, frames: dict[str, pd.DataFrame]) -> Path | None:
+    """Write a convenience workbook without failing on Excel's row limit.
+
+    CSV remains the authoritative format for very large operational tables. Excel
+    supports at most 1,048,576 rows per worksheet (including the header), so frames
+    exceeding that limit are intentionally left CSV-only and listed on a manifest
+    sheet instead of causing the entire workbook export to fail.
+    """
     out = results_dir / "combined_results.xlsx"
+    excel_max_data_rows = 1_048_575
+    omitted = []
     try:
         with pd.ExcelWriter(out) as writer:
             for name, df in frames.items():
+                if len(df) > excel_max_data_rows:
+                    omitted.append({
+                        "Table": str(name),
+                        "Rows": int(len(df)),
+                        "Reason": "CSV only: exceeds Excel worksheet row limit",
+                    })
+                    continue
                 df.to_excel(writer, sheet_name=name[:31], index=False)
+            if omitted:
+                pd.DataFrame(omitted).to_excel(
+                    writer, sheet_name="large_tables_csv_only", index=False
+                )
+        if omitted:
+            names = ", ".join(str(row["Table"]) for row in omitted)
+            print(
+                "Combined XLSX written; oversized tables kept as CSV only: " + names
+            )
         return out
     except Exception as exc:
         print(f"WARNING: Could not write combined XLSX ({exc}). CSV files were still written.")

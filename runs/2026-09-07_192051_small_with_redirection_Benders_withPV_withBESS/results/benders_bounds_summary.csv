@@ -1,0 +1,9 @@
+metric,value
+best_certified_LB_SEK,126991462.44740003
+global_best_UB_SEK,126992432.2276
+final_Benders_gap,7.636577934217884e-06
+best_certified_iteration,10.0
+final_iteration,10.0
+final_cuts_added,4.0
+final_bad_slots,0.0
+final_max_theta_violation_SEK,115.78572863467357

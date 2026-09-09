@@ -30,6 +30,65 @@ MONTH_DAYS = {
     "September": 30, "October": 31, "November": 30, "December": 31,
 }
 
+METHODS = ("Monolithic", "Benders", "LBBD")
+
+MEMORY_TRACE_CANDIDATES = (
+    Path("results/resource_usage.csv"),
+    Path("results/resource_monitor.csv"),
+    Path("results/memory_trace.csv"),
+    Path("results/rss_trace.csv"),
+    Path("logs/resource_usage.csv"),
+    Path("logs/resource_monitor.csv"),
+    Path("logs/memory_trace.csv"),
+    Path("logs/rss_trace.csv"),
+)
+
+MEMORY_ELAPSED_COLUMNS = (
+    "elapsed_seconds",
+    "elapsed_s",
+    "elapsed",
+    "seconds",
+    "time_seconds",
+)
+
+MEMORY_TIMESTAMP_COLUMNS = (
+    "timestamp",
+    "datetime",
+    "sample_time",
+    "wall_time",
+)
+
+MEMORY_RSS_MB_COLUMNS = (
+    "process_tree_rss_MB",
+    "process_tree_rss_mb",
+    "total_rss_MB",
+    "total_rss_mb",
+    "rss_MB",
+    "rss_mb",
+)
+
+MEMORY_RSS_GB_COLUMNS = (
+    "process_tree_rss_GB",
+    "process_tree_rss_gb",
+    "total_rss_GB",
+    "total_rss_gb",
+    "rss_GB",
+    "rss_gb",
+)
+
+MEMORY_RSS_BYTES_COLUMNS = (
+    "process_tree_rss_bytes",
+    "total_rss_bytes",
+    "rss_bytes",
+)
+
+MEMORY_PHASE_COLUMNS = (
+    "phase",
+    "stage",
+    "solver_role",
+    "model_role",
+)
+
 
 def load_json(path: Path) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8"))
@@ -54,6 +113,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-complexity-recompute", action="store_true",
         help="Do not reload project inputs to recompute exact preprocessing/redirection set sizes.",
+    )
+    parser.add_argument(
+        "--monolithic-memory-trace",
+        default=None,
+        help="Optional CSV with elapsed time and process-tree RSS samples for the monolithic run.",
+    )
+    parser.add_argument(
+        "--benders-memory-trace",
+        default=None,
+        help="Optional CSV with elapsed time and process-tree RSS samples for the Benders run.",
+    )
+    parser.add_argument(
+        "--lbbd-memory-trace",
+        default=None,
+        help="Optional CSV with elapsed time and process-tree RSS samples for the LBBD run.",
     )
     return parser.parse_args()
 
@@ -126,6 +200,8 @@ def _active_redirection_arcs(run_dir: Path) -> float:
 
 
 def _load_capacity_config(project_root: Path) -> dict[str, float]:
+    import json
+
     path = project_root / "config" / "model_config.json"
     cfg = json.loads(path.read_text(encoding="utf-8"))
     return {str(k): float(v) for k, v in cfg["charger_capacity_kwh_per_slot"].items()}
@@ -239,6 +315,318 @@ def _history_total_seconds(run_dir: Path) -> float:
         except Exception:
             pass
     return math.nan
+
+
+
+def _column(frame: pd.DataFrame, names: tuple[str, ...]) -> str | None:
+    lookup = {str(column).strip().lower(): str(column) for column in frame.columns}
+    for name in names:
+        column = lookup.get(name.lower())
+        if column is not None:
+            return column
+    return None
+
+
+def _read_memory_trace_file(path: Path, method: str) -> pd.DataFrame:
+    frame = _read_csv_if_present(path)
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+
+    elapsed_col = _column(frame, MEMORY_ELAPSED_COLUMNS)
+    timestamp_col = _column(frame, MEMORY_TIMESTAMP_COLUMNS)
+
+    if elapsed_col is not None:
+        elapsed = pd.to_numeric(frame[elapsed_col], errors="coerce")
+    elif timestamp_col is not None:
+        timestamp = pd.to_datetime(frame[timestamp_col], errors="coerce", utc=True)
+        if timestamp.notna().sum() < 2:
+            return pd.DataFrame()
+        elapsed = (timestamp - timestamp.min()).dt.total_seconds()
+    else:
+        return pd.DataFrame()
+
+    rss_mb_col = _column(frame, MEMORY_RSS_MB_COLUMNS)
+    rss_gb_col = _column(frame, MEMORY_RSS_GB_COLUMNS)
+    rss_bytes_col = _column(frame, MEMORY_RSS_BYTES_COLUMNS)
+
+    if rss_mb_col is not None:
+        rss_mb = pd.to_numeric(frame[rss_mb_col], errors="coerce")
+    elif rss_gb_col is not None:
+        rss_mb = pd.to_numeric(frame[rss_gb_col], errors="coerce") * 1024.0
+    elif rss_bytes_col is not None:
+        rss_mb = pd.to_numeric(frame[rss_bytes_col], errors="coerce") / (1024.0 ** 2)
+    else:
+        return pd.DataFrame()
+
+    phase_col = _column(frame, MEMORY_PHASE_COLUMNS)
+    if phase_col is not None:
+        phase = frame[phase_col].fillna("").astype(str)
+    else:
+        phase = pd.Series([""] * len(frame), index=frame.index, dtype="object")
+
+    out = pd.DataFrame(
+        {
+            "Method": method,
+            "elapsed_seconds": elapsed,
+            "process_tree_rss_MB": rss_mb,
+            "Phase": phase,
+            "Trace source": str(path),
+        }
+    )
+
+    out = out.dropna(subset=["elapsed_seconds", "process_tree_rss_MB"])
+    out = out[
+        (out["elapsed_seconds"] >= 0.0)
+        & (out["process_tree_rss_MB"] >= 0.0)
+    ].copy()
+
+    if out.empty:
+        return out
+
+    out = (
+        out.sort_values("elapsed_seconds")
+        .drop_duplicates(subset=["elapsed_seconds"], keep="last")
+        .reset_index(drop=True)
+    )
+
+    elapsed_origin = float(out["elapsed_seconds"].iloc[0])
+    out["elapsed_seconds"] = out["elapsed_seconds"] - elapsed_origin
+    out["elapsed_minutes"] = out["elapsed_seconds"] / 60.0
+    out["process_tree_rss_GB"] = out["process_tree_rss_MB"] / 1024.0
+
+    duration = float(out["elapsed_seconds"].max())
+    if duration > 0.0:
+        out["normalized_elapsed"] = out["elapsed_seconds"] / duration
+    else:
+        out["normalized_elapsed"] = 0.0
+
+    return out
+
+
+def _discover_memory_trace(
+    run_dir: Path,
+    method: str,
+    override: Path | None,
+) -> tuple[pd.DataFrame, str]:
+    candidates: list[Path] = []
+
+    if override is not None:
+        candidates.append(override)
+
+    candidates.extend(run_dir / relative for relative in MEMORY_TRACE_CANDIDATES)
+
+    seen: set[Path] = set()
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+
+        if not resolved.exists():
+            continue
+
+        frame = _read_memory_trace_file(resolved, method)
+        if not frame.empty:
+            return frame, str(resolved)
+
+    return pd.DataFrame(), ""
+
+
+def _time_weighted_memory(frame: pd.DataFrame) -> tuple[float, float]:
+    if frame is None or len(frame) < 2:
+        return math.nan, math.nan
+
+    elapsed = pd.to_numeric(frame["elapsed_seconds"], errors="coerce").to_numpy(dtype=float)
+    rss = pd.to_numeric(frame["process_tree_rss_MB"], errors="coerce").to_numpy(dtype=float)
+
+    valid = (
+        pd.notna(elapsed)
+        & pd.notna(rss)
+    )
+    elapsed = elapsed[valid]
+    rss = rss[valid]
+
+    if len(elapsed) < 2:
+        return math.nan, math.nan
+
+    integral_mb_seconds = 0.0
+    total_seconds = 0.0
+
+    for index in range(len(elapsed) - 1):
+        dt = float(elapsed[index + 1] - elapsed[index])
+        if dt <= 0.0:
+            continue
+        integral_mb_seconds += 0.5 * float(rss[index] + rss[index + 1]) * dt
+        total_seconds += dt
+
+    if total_seconds <= 0.0:
+        return math.nan, math.nan
+
+    weighted_mean_mb = integral_mb_seconds / total_seconds
+    memory_time_gb_hours = integral_mb_seconds / (1024.0 * 3600.0)
+    return weighted_mean_mb, memory_time_gb_hours
+
+
+def _memory_frames(
+    run_dirs: dict[str, Path],
+    trace_overrides: dict[str, Path | None],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    rows: list[dict[str, Any]] = []
+    traces: list[pd.DataFrame] = []
+
+    for method in METHODS:
+        run_dir = run_dirs.get(method)
+        if run_dir is None:
+            rows.append(
+                {
+                    "Method": method,
+                    "Run available": False,
+                    "Trace available": False,
+                    "Trace source": "",
+                }
+            )
+            continue
+
+        scalars = read_scalar_file(run_dir)
+        runtime = _first_scalar(scalars, "total_runtime_seconds")
+        if not math.isfinite(runtime):
+            runtime = _history_total_seconds(run_dir)
+
+        scalar_peak = _first_scalar(scalars, "peak_process_tree_rss_MB")
+
+        trace, source = _discover_memory_trace(
+            run_dir,
+            method,
+            trace_overrides.get(method),
+        )
+
+        row: dict[str, Any] = {
+            "Method": method,
+            "Run available": True,
+            "Trace available": not trace.empty,
+            "Trace source": source,
+            "Run runtime (s)": runtime,
+            "Run runtime (min)": runtime / 60.0 if math.isfinite(runtime) else math.nan,
+            "Scalar peak RSS (MB)": scalar_peak,
+            "Scalar peak RSS (GB)": scalar_peak / 1024.0 if math.isfinite(scalar_peak) else math.nan,
+        }
+
+        if trace.empty:
+            rows.append(row)
+            continue
+
+        traces.append(trace)
+
+        sampled_peak = float(trace["process_tree_rss_MB"].max())
+        duration = float(trace["elapsed_seconds"].max())
+        intervals = pd.to_numeric(trace["elapsed_seconds"], errors="coerce").diff().dropna()
+        weighted_mean, memory_time = _time_weighted_memory(trace)
+
+        row.update(
+            {
+                "Samples": int(len(trace)),
+                "Median sample interval (s)": (
+                    float(intervals.median()) if not intervals.empty else math.nan
+                ),
+                "Trace duration (s)": duration,
+                "Trace duration (min)": duration / 60.0,
+                "Runtime coverage (fraction)": (
+                    duration / runtime
+                    if math.isfinite(runtime) and runtime > 0.0
+                    else math.nan
+                ),
+                "Trace peak RSS (MB)": sampled_peak,
+                "Trace peak RSS (GB)": sampled_peak / 1024.0,
+                "Mean RSS (MB)": float(trace["process_tree_rss_MB"].mean()),
+                "Median RSS (MB)": float(trace["process_tree_rss_MB"].median()),
+                "P95 RSS (MB)": float(trace["process_tree_rss_MB"].quantile(0.95)),
+                "Time-weighted mean RSS (MB)": weighted_mean,
+                "Memory-time integral (GB h)": memory_time,
+                "Trace peak difference vs scalar (fraction)": (
+                    (sampled_peak - scalar_peak) / abs(scalar_peak)
+                    if math.isfinite(scalar_peak) and abs(scalar_peak) > 1e-12
+                    else math.nan
+                ),
+            }
+        )
+        rows.append(row)
+
+    summary = pd.DataFrame(rows)
+    trace_frame = (
+        pd.concat(traces, ignore_index=True)
+        if traces
+        else pd.DataFrame()
+    )
+    return summary, trace_frame
+
+
+def _write_rss_figure(
+    memory_trace: pd.DataFrame,
+    comparison_output: Path,
+) -> list[Path]:
+    if memory_trace is None or memory_trace.empty:
+        return []
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        print(f"WARNING: Matplotlib is unavailable; RSS figure skipped: {exc}")
+        return []
+
+    fig, axes = plt.subplots(1, 2, figsize=(12.0, 4.8))
+
+    plotted = 0
+    for method in METHODS:
+        subset = memory_trace[memory_trace["Method"] == method].copy()
+        if subset.empty:
+            continue
+
+        subset = subset.sort_values("elapsed_seconds")
+        axes[0].plot(
+            subset["elapsed_minutes"],
+            subset["process_tree_rss_GB"],
+            label=method,
+            linewidth=1.5,
+        )
+        axes[1].plot(
+            100.0 * subset["normalized_elapsed"],
+            subset["process_tree_rss_GB"],
+            label=method,
+            linewidth=1.5,
+        )
+        plotted += 1
+
+    axes[0].set_xlabel("Elapsed time (min)")
+    axes[0].set_ylabel("Process-tree RSS (GB)")
+    axes[0].set_title("Absolute elapsed time")
+
+    axes[1].set_xlabel("Elapsed run time (%)")
+    axes[1].set_ylabel("Process-tree RSS (GB)")
+    axes[1].set_title("Normalized elapsed time")
+
+    for ax in axes:
+        ax.grid(True, alpha=0.25)
+
+    if plotted > 1:
+        axes[1].legend(frameon=False)
+
+    fig.suptitle("Process-tree resident memory over time")
+    fig.tight_layout()
+
+    pdf_path = comparison_output.with_name(
+        comparison_output.stem + "_rss_vs_elapsed_time.pdf"
+    )
+    png_path = comparison_output.with_name(
+        comparison_output.stem + "_rss_vs_elapsed_time.png"
+    )
+
+    fig.savefig(pdf_path, bbox_inches="tight")
+    fig.savefig(png_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    return [pdf_path, png_path]
 
 
 def _complexity_frames(run_dirs: dict[str, Path]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -707,7 +1095,7 @@ def _style_workbook(path: Path, requested: pd.DataFrame) -> None:
     white = "FFFFFF"
     thin = Side(style="thin", color="B7C9D6")
 
-    ws = wb["Requested comparison"]
+    ws = wb["Comparison"]
     ws.freeze_panes = "B7"
     ws.auto_filter.ref = f"A6:H{ws.max_row}"
     ws.sheet_view.showGridLines = False
@@ -787,6 +1175,7 @@ def _style_workbook(path: Path, requested: pd.DataFrame) -> None:
         "Computational summary", "Build timing", "Redirection complexity",
         "Solver complexity", "Solver log detail", "Preprocessing scalars",
         "Benders complexity", "LBBD complexity", "Efficiency summary",
+        "Memory summary", "Memory trace",
     ]:
         if sheet_name not in wb.sheetnames:
             continue
@@ -839,6 +1228,30 @@ def _style_workbook(path: Path, requested: pd.DataFrame) -> None:
             if extra.max_column >= 10:
                 extra.column_dimensions[get_column_letter(extra.max_column - 1)].width = 18
                 extra.column_dimensions[get_column_letter(extra.max_column)].width = 60
+        elif sheet_name == "Memory summary":
+            extra.column_dimensions["A"].width = 16
+            extra.column_dimensions["B"].width = 14
+            extra.column_dimensions["C"].width = 14
+            extra.column_dimensions["D"].width = 60
+            for col in range(5, extra.max_column + 1):
+                extra.column_dimensions[get_column_letter(col)].width = 22
+            headers = {
+                str(extra.cell(1, col).value or ""): col
+                for col in range(1, extra.max_column + 1)
+            }
+            for header in ("Runtime coverage (fraction)", "Trace peak difference vs scalar (fraction)"):
+                col = headers.get(header)
+                if col is not None:
+                    for row in range(2, extra.max_row + 1):
+                        extra.cell(row, col).number_format = "0.00%"
+        elif sheet_name == "Memory trace":
+            extra.column_dimensions["A"].width = 16
+            extra.column_dimensions["B"].width = 18
+            extra.column_dimensions["C"].width = 22
+            extra.column_dimensions["D"].width = 16
+            extra.column_dimensions["E"].width = 60
+            for col in range(6, extra.max_column + 1):
+                extra.column_dimensions[get_column_letter(col)].width = 20
     wb.save(path)
 
 
@@ -875,6 +1288,18 @@ def main() -> int:
     requested = _requested_frame(all_metrics)
     raw = _raw_frame(all_metrics)
     computational_summary, build_timing, solver_complexity, solver_log_detail = _complexity_frames(run_dirs)
+
+    trace_values = {
+        "Monolithic": args.monolithic_memory_trace,
+        "Benders": args.benders_memory_trace,
+        "LBBD": args.lbbd_memory_trace,
+    }
+    trace_overrides = {
+        method: _resolve(root, value) if value is not None else None
+        for method, value in trace_values.items()
+    }
+    memory_summary, memory_trace = _memory_frames(run_dirs, trace_overrides)
+
     dataset = _infer_dataset(run_dirs, args.dataset)
     scenario = _infer_scenario(run_dirs, args.scenario)
     preprocessing_frame = pd.DataFrame()
@@ -908,7 +1333,7 @@ def main() -> int:
     )
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         # Leave rows 1-5 for title and run paths.
-        visible_requested.to_excel(writer, sheet_name="Requested comparison", index=False, startrow=5)
+        visible_requested.to_excel(writer, sheet_name="Comparison", index=False, startrow=5)
         raw.to_excel(writer, sheet_name="Raw metrics", index=False)
         run_folders.to_excel(writer, sheet_name="Run folders", index=False)
         computational_summary.to_excel(writer, sheet_name="Computational summary", index=False)
@@ -920,18 +1345,29 @@ def main() -> int:
         benders_complexity.to_excel(writer, sheet_name="Benders complexity", index=False)
         lbbd_complexity.to_excel(writer, sheet_name="LBBD complexity", index=False)
         efficiency_summary.to_excel(writer, sheet_name="Efficiency summary", index=False)
+        memory_summary.to_excel(writer, sheet_name="Memory summary", index=False, na_rep="NA")
+        if not memory_trace.empty:
+            memory_trace.to_excel(writer, sheet_name="Memory trace", index=False)
     wb = load_workbook(output)
-    ws = wb["Requested comparison"]
+    ws = wb["Comparison"]
     ws["B2"] = str(run_dirs["Monolithic"])
     ws["B3"] = str(run_dirs["Benders"])
     ws["B4"] = str(run_dirs["LBBD"])
     wb.save(output)
     _style_workbook(output, requested)
 
-    csv_path = output.with_name(output.stem + "_requested_table.csv")
-    visible_requested.to_csv(csv_path, index=False)
+    rss_paths = _write_rss_figure(memory_trace, output)
+    if rss_paths:
+        for path in rss_paths:
+            print(f"RSS figure written to: {path}")
+    else:
+        print(
+            "WARNING: No temporal RSS trace was found. "
+            "The Memory summary sheet contains the available scalar peak RSS, "
+            "but an RSS-versus-time curve cannot be reconstructed."
+        )
+
     print(f"Comparison workbook written to: {output}")
-    print(f"Requested comparison CSV written to: {csv_path}")
     return 0
 
 

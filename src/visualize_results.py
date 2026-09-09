@@ -774,106 +774,154 @@ def _plot_decomposition_cut_generation(run_dir: Path, figures_dir: Path, dpi: in
     df = _read_csv(path, required=True)
     if df.empty or "iteration" not in df.columns:
         raise ValueError("Decomposition history lacks iteration data")
+
     method = _history_method(df, path)
     iteration = _numeric(df["iteration"]).astype(int)
+    x = np.arange(len(iteration))
 
     if method != "LBBD":
         cuts = _numeric(df["cuts_added"]).fillna(0.0) if "cuts_added" in df.columns else pd.Series(0.0, index=df.index)
         candidates = _numeric(df["cut_candidates"]).fillna(cuts) if "cut_candidates" in df.columns else cuts.copy()
         cumulative = cuts.cumsum()
-        x = np.arange(len(iteration))
         width = 0.36
+
         fig, ax = plt.subplots(figsize=(9.8, 5.9))
-        bars_candidates = ax.bar(x - width / 2, candidates, width=width, label="Cut candidates / triggers", alpha=0.72, zorder=2)
-        bars_added = ax.bar(x + width / 2, cuts, width=width, label="Cuts added", alpha=0.90, zorder=3)
+        bars_candidates = ax.bar(
+            x - width / 2, candidates, width=width,
+            label="Cut candidates / triggers", alpha=0.72, zorder=2,
+        )
+        bars_added = ax.bar(
+            x + width / 2, cuts, width=width,
+            label="Cuts added", alpha=0.90, zorder=3,
+        )
         ax.set_xticks(x)
         ax.set_xticklabels(iteration.astype(str))
         ax.set_xlabel(f"{method} iteration")
         ax.set_ylabel("Cuts in iteration")
         ax.set_title(f"{method} cut generation and cumulative master enrichment")
+
         for container in (bars_candidates, bars_added):
             labels = [f"{int(v)}" if v > 0 else "" for v in container.datavalues]
             ax.bar_label(container, labels=labels, padding=2, fontsize=8)
+
         ax2 = ax.twinx()
-        cumulative_line, = ax2.plot(x, cumulative, marker="o", linewidth=2.3, label="Cumulative cuts", zorder=5)
+        cumulative_line, = ax2.plot(
+            x, cumulative, marker="o", linewidth=2.3,
+            label="Cumulative cuts", zorder=5,
+        )
         ax2.set_ylabel("Cumulative cuts in master")
-        ax2.set_ylim(0, max(1.0, 1.15 * float(cumulative.max()) if len(cumulative) else 1.0))
+        ax2.set_ylim(
+            0,
+            max(1.0, 1.15 * float(cumulative.max()) if len(cumulative) else 1.0),
+        )
         ax2.grid(False)
-        _annotate_selected_points(ax2, x, cumulative.to_numpy(dtype=float), lambda y: f"{int(round(y))}", color=cumulative_line.get_color(), every=True)
+
         h1, l1 = ax.get_legend_handles_labels()
-        _boxed_legend_below(fig, h1 + [cumulative_line], l1 + ["Cumulative cuts"], ncol=3, bottom=0.23)
+        _boxed_legend_below(
+            fig,
+            h1 + [cumulative_line],
+            l1 + ["Cumulative cuts"],
+            ncol=3,
+            bottom=0.23,
+        )
         return _save(fig, figures_dir, "17_decomposition_cut_generation", dpi)
 
-    cut_families = _lbbd_cut_columns(df)
-    added_columns = [col for col, _ in cut_families]
-    cuts = _sum_columns(df, added_columns)
-    cumulative = cuts.cumsum()
-    x = np.arange(len(iteration))
+    families = [
+        (column, label)
+        for column, label in _lbbd_cut_columns(df)
+        if column in df.columns
+    ]
+    if not families:
+        raise ValueError("LBBD history lacks cut-family columns")
 
-    # LBBD-specific view: the important question is not just how many cuts were
-    # added, but whether the LP/core-point oracles actually found violated cuts.
-    annual_violation = _numeric(df["annual_lp_violation_SEK"]).fillna(0.0) / 1e3 if "annual_lp_violation_SEK" in df.columns else pd.Series(0.0, index=df.index)
-    core_violation = _numeric(df["annual_core_violation_at_candidate_SEK"]).fillna(0.0) / 1e3 if "annual_core_violation_at_candidate_SEK" in df.columns else pd.Series(0.0, index=df.index)
-    partial_violated = _numeric(df["partial_logic_cuts_violated"]).fillna(0.0) if "partial_logic_cuts_violated" in df.columns else pd.Series(0.0, index=df.index)
-    comp_violated = _numeric(df["component_lp_cuts_violated"]).fillna(0.0) if "component_lp_cuts_violated" in df.columns else pd.Series(0.0, index=df.index)
+    values = {
+        label: _numeric(df[column]).fillna(0.0)
+        for column, label in families
+    }
+    active = [
+        (label, series)
+        for label, series in values.items()
+        if float(series.sum()) > 0
+    ]
 
-    fig, (ax_top, ax_bottom) = plt.subplots(
-        2, 1, figsize=(11.2, 8.0), sharex=True,
-        gridspec_kw={"height_ratios": [1.0, 1.15]},
+    if not active:
+        raise ValueError("No LBBD cuts were accepted")
+
+    total = sum(
+        (series for _, series in active),
+        start=pd.Series(0.0, index=df.index),
     )
+    cumulative = total.cumsum()
 
-    bars = ax_top.bar(x, cuts, width=0.62, label="Cuts accepted into master", alpha=0.88)
-    ax_top.bar_label(bars, labels=[f"{int(v)}" if v > 0 else "0" for v in cuts], padding=2, fontsize=8)
-    ax_top.set_ylabel("Accepted cuts")
-    ax_top.set_title("LBBD cut generation: accepted cuts and separation diagnostics")
-    ax_top.set_ylim(0, max(1.0, 1.30 * float(max(cuts.max(), 1.0))))
-    ax_top2 = ax_top.twinx()
-    cum_line, = ax_top2.plot(x, cumulative, marker="o", linewidth=2.1, label="Cumulative cuts")
-    ax_top2.set_ylabel("Cumulative accepted cuts")
-    ax_top2.set_ylim(0, max(1.0, 1.25 * float(max(cumulative.max(), 1.0))))
-    ax_top2.grid(False)
-    _annotate_selected_points(ax_top2, x, cumulative.to_numpy(dtype=float), lambda y: f"cum {int(round(y))}", color=cum_line.get_color(), every=True)
+    fig, ax = plt.subplots(figsize=(10.5, 6.1))
+    bottom = np.zeros(len(df), dtype=float)
 
-    ann_line, = ax_bottom.plot(x, annual_violation, marker="o", linewidth=1.8, label="Candidate annual-LP violation (kSEK)")
-    core_line, = ax_bottom.plot(x, core_violation, marker="s", linestyle="--", linewidth=1.8, label="Core-point annual-LP violation at candidate (kSEK)")
-    ax_bottom.axhline(0, linewidth=1.0, color="0.30")
-    ax_bottom.set_ylabel("Violation before filtering (kSEK)")
-    ax_bottom.set_xlabel("LBBD iteration")
-    ax_bottom.set_xticks(x)
-    ax_bottom.set_xticklabels(iteration.astype(str))
-    _annotate_selected_points(ax_bottom, x, annual_violation.to_numpy(dtype=float), lambda y: f"{y:.1f}", color=ann_line.get_color(), every=True)
-    _annotate_selected_points(ax_bottom, x, core_violation.to_numpy(dtype=float), lambda y: f"{y:.1f}", color=core_line.get_color(), every=True)
+    for label, series in active:
+        vals = series.to_numpy(dtype=float)
+        ax.bar(
+            x,
+            vals,
+            bottom=bottom,
+            width=0.64,
+            label=label,
+            zorder=3,
+        )
+        bottom += vals
 
-    ax_count = ax_bottom.twinx()
-    violated_total = comp_violated + partial_violated
-    if float(violated_total.max()) > 0:
-        vio_line, = ax_count.step(x, violated_total, where="mid", linewidth=1.6, label="Violated component/logic cuts")
-        ax_count.set_ylabel("Violated discrete cuts")
-        ax_count.set_ylim(0, 1.20 * float(violated_total.max()))
-        ax_count.grid(False)
-        extra_handles = [vio_line]
-        extra_labels = ["Violated component/logic cuts"]
-    else:
-        extra_handles, extra_labels = [], []
-        ax_count.set_yticks([])
+    for k, value in enumerate(bottom):
+        if value > 0:
+            ax.text(
+                x[k],
+                value,
+                f"{int(round(value))}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
 
-    handles1, labels1 = ax_top.get_legend_handles_labels()
-    handles2, labels2 = ax_top2.get_legend_handles_labels()
-    handles3, labels3 = ax_bottom.get_legend_handles_labels()
+    ax.set_xticks(x)
+    ax.set_xticklabels(iteration.astype(str))
+    ax.set_xlabel("LBBD iteration")
+    ax.set_ylabel("Cuts added in iteration")
+    ax.set_title("LBBD cut generation and cumulative master enrichment")
+    ax.set_ylim(0, max(1.0, 1.25 * float(max(bottom))))
+
+    ax2 = ax.twinx()
+    cumulative_line, = ax2.plot(
+        x,
+        cumulative.to_numpy(dtype=float),
+        marker="o",
+        linewidth=2.3,
+        label="Cumulative cuts",
+        zorder=5,
+    )
+    ax2.set_ylabel("Cumulative cuts in master")
+    ax2.set_ylim(0, max(1.0, 1.15 * float(cumulative.max())))
+    ax2.grid(False)
+
+    cumulative_values = cumulative.to_numpy(dtype=float)
+    for k, value in enumerate(cumulative_values):
+        changed = k == 0 or value != cumulative_values[k - 1]
+        final = k == len(cumulative_values) - 1
+        if changed or final:
+            _annotate_xy(
+                ax2,
+                float(x[k]),
+                float(value),
+                f"{int(round(value))}",
+                color=cumulative_line.get_color(),
+                xytext=(0, 8),
+                fontsize=8,
+            )
+
+    h1, l1 = ax.get_legend_handles_labels()
     _boxed_legend_below(
         fig,
-        handles1 + handles2 + handles3 + extra_handles,
-        labels1 + labels2 + labels3 + extra_labels,
-        ncol=2,
-        bottom=0.24,
+        h1 + [cumulative_line],
+        l1 + ["Cumulative cuts"],
+        ncol=min(4, len(h1) + 1),
+        bottom=0.23,
     )
-    if float(cuts.sum()) <= 3 and float((annual_violation > 1e-6).sum()) == 0:
-        fig.text(
-            0.50, 0.965,
-            "Only exact-configuration cuts were accepted; LP/core violations were zero or negative at the tested candidates.",
-            ha="center", va="top", fontsize=9,
-            bbox=dict(boxstyle="round,pad=0.25", fc="#FFF8DC", ec="0.70", alpha=0.95),
-        )
     return _save(fig, figures_dir, "17_decomposition_cut_generation", dpi)
 
 
@@ -890,134 +938,254 @@ def _load_lbbd_history(run_dir: Path) -> pd.DataFrame:
 
 def _plot_lbbd_cut_families(run_dir: Path, figures_dir: Path, dpi: int) -> list[str]:
     df = _load_lbbd_history(run_dir)
-    families = [(column, label) for column, label in _lbbd_cut_columns(df) if column in df.columns]
+
+    families = [
+        (column, label)
+        for column, label in _lbbd_cut_columns(df)
+        if column in df.columns
+    ]
     if not families:
         raise ValueError("LBBD history lacks cut-family columns")
-    iteration = _numeric(df["iteration"]).astype(int).to_numpy()
-    matrix = pd.DataFrame({label: _numeric(df[column]).fillna(0.0).to_numpy(dtype=float) for column, label in families}, index=iteration)
-    totals = matrix.sum(axis=0)
-    if float(totals.sum()) <= 0:
-        raise ValueError("No LBBD cuts were added")
 
-    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(13.8, 5.9), gridspec_kw={"width_ratios": [0.95, 1.55]})
+    totals = pd.Series({
+        label: float(_numeric(df[column]).fillna(0.0).sum())
+        for column, label in families
+    })
 
-    y = np.arange(len(totals))
-    bars = ax_left.barh(y, totals.to_numpy(dtype=float), height=0.62)
-    ax_left.set_yticks(y)
-    ax_left.set_yticklabels(totals.index)
-    ax_left.set_xlabel("Total cuts accepted")
-    ax_left.set_title("Total cuts by family")
-    max_total = max(1.0, float(totals.max()))
-    ax_left.set_xlim(0, 1.25 * max_total)
-    for bar, value in zip(bars, totals):
-        label = f"{int(value)}" if value > 0 else "0"
-        ax_left.text(bar.get_width() + 0.03 * max_total, bar.get_y() + bar.get_height() / 2, label, va="center", fontsize=9)
+    active = totals[totals > 0]
+    if active.empty:
+        raise ValueError("No LBBD cuts were accepted")
 
-    image = ax_right.imshow(matrix.T.to_numpy(dtype=float), aspect="auto", interpolation="nearest")
-    ax_right.set_yticks(np.arange(len(matrix.columns)))
-    ax_right.set_yticklabels(matrix.columns)
-    ax_right.set_xticks(np.arange(len(iteration)))
-    ax_right.set_xticklabels(iteration.astype(str))
-    ax_right.set_xlabel("LBBD iteration")
-    ax_right.set_title("Cut-family activity by iteration")
-    for row in range(matrix.shape[1]):
-        for col in range(matrix.shape[0]):
-            value = matrix.iloc[col, row]
-            if value > 0:
-                ax_right.text(col, row, f"{int(value)}", ha="center", va="center", fontsize=8, color="white" if value >= max_total / 2 else "black")
-    cbar = fig.colorbar(image, ax=ax_right, fraction=0.045, pad=0.03)
-    cbar.set_label("Cuts accepted")
+    fig, ax = plt.subplots(figsize=(8.8, 5.2))
+    y = np.arange(len(active))
+    bars = ax.barh(y, active.to_numpy(dtype=float), height=0.60)
 
-    if float(totals.drop(labels=["Exact configuration"], errors="ignore").sum()) <= 0 and "Exact configuration" in totals.index:
-        fig.text(
-            0.50, 0.015,
-            "Interpretation: this run closed almost entirely through the embedded relaxation and exact configuration cuts; other cut families were available but not violated enough to be inserted.",
-            ha="center", va="bottom", fontsize=9,
-            bbox=dict(boxstyle="round,pad=0.25", fc="#FFF8DC", ec="0.70", alpha=0.95),
+    ax.set_yticks(y)
+    ax.set_yticklabels(active.index)
+    ax.invert_yaxis()
+    ax.set_xlabel("Cuts accepted into master")
+    ax.set_title(
+        f"Accepted LBBD cuts by family "
+        f"({len(active)} of {len(families)} families active)"
+    )
+
+    maximum = max(1.0, float(active.max()))
+    ax.set_xlim(0, 1.20 * maximum)
+
+    for bar, value in zip(bars, active):
+        ax.text(
+            bar.get_width() + 0.025 * maximum,
+            bar.get_y() + bar.get_height() / 2,
+            f"{int(round(value))}",
+            ha="left",
+            va="center",
         )
-        fig.subplots_adjust(bottom=0.17)
-    else:
-        fig.subplots_adjust(bottom=0.11)
+
+    ax.grid(axis="x", alpha=0.25)
+    ax.grid(axis="y", visible=False)
+
     return _save(fig, figures_dir, "18_lbbd_cut_families", dpi)
 
 
 
 def _plot_lbbd_candidate_bounds(run_dir: Path, figures_dir: Path, dpi: int) -> list[str]:
+    """Show exact certification quality of evaluated infrastructures.
+
+    Master/global bounds are intentionally excluded here.  Bootstrap and LP-fallback
+    candidates are not primal solutions of the same master MIP, so mixing their Eta
+    values with exact recourse can create visually dramatic but algorithmically
+    meaningless "relaxation errors".  Global bound convergence is shown in figure 09.
+    """
     df = _load_lbbd_history(run_dir)
-    iteration = _numeric(df["iteration"])
-    exact_col = "candidate_exact_objective_SEK"
-    if exact_col not in df.columns or not _numeric(df[exact_col]).notna().any():
+    if "candidate_exact_objective_SEK" not in df.columns:
         raise ValueError("LBBD history lacks exact candidate objectives")
-    exact = _numeric(df[exact_col])
-    series = [
-        ("master_eta_SEK", "Master candidate value"),
-        ("annual_lp_upper_SEK", "Annual LP upper estimate"),
-        ("candidate_fixed_upper_bound_SEK", "Fixed-layout MIP upper bound"),
-        ("candidate_exact_objective_SEK", "Fixed-layout feasible objective"),
-    ]
-    present = [(column, label) for column, label in series if column in df.columns and _numeric(df[column]).notna().any()]
-    if len(present) < 2:
-        raise ValueError("LBBD history lacks candidate-bound diagnostics")
+    iteration = _numeric(df["iteration"])
+    exact = _numeric(df["candidate_exact_objective_SEK"]) / 1e6
+    fixed_ub = (
+        _numeric(df["candidate_fixed_upper_bound_SEK"]) / 1e6
+        if "candidate_fixed_upper_bound_SEK" in df.columns
+        else pd.Series(np.nan, index=df.index)
+    )
+    best_lb = (
+        _numeric(df["best_lb_SEK"]) / 1e6
+        if "best_lb_SEK" in df.columns
+        else exact.cummax()
+    )
+    fixed_gap = (
+        100.0 * _numeric(df["candidate_fixed_gap"])
+        if "candidate_fixed_gap" in df.columns
+        else pd.Series(np.nan, index=df.index)
+    )
 
-    fig, (ax_top, ax_bottom) = plt.subplots(2, 1, figsize=(11.4, 8.2), sharex=True, gridspec_kw={"height_ratios": [1.15, 0.95]})
-    for column, label in present:
-        values = _numeric(df[column]) / 1e6
-        line, = ax_top.plot(iteration, values, marker="o", linewidth=1.8, label=label)
-        if column == exact_col:
-            _annotate_selected_points(ax_top, iteration, values, lambda y: f"{y:.3f} MSEK", color=line.get_color(), every=True)
+    if exact.notna().sum() == 0:
+        raise ValueError("No exact candidate certifications in LBBD history")
+
+    fig, (ax_top, ax_bottom) = plt.subplots(
+        2, 1, figsize=(11.4, 8.2), sharex=True,
+        gridspec_kw={"height_ratios": [1.2, 0.8]},
+    )
+    ax_top.ticklabel_format(axis="y", style="plain", useOffset=False)
+    line_exact, = ax_top.plot(iteration, exact, marker="o", linewidth=1.9, label="Exact feasible candidate")
+    if fixed_ub.notna().any():
+        ax_top.plot(iteration, fixed_ub, marker="o", linewidth=1.5, linestyle="--", label="Fixed-layout exact upper bound")
+    if best_lb.notna().any():
+        ax_top.step(iteration, best_lb, where="post", linewidth=2.2, label="Best certified incumbent")
+
+    _annotate_selected_points(ax_top, iteration, exact, lambda y: f"{y:.3f} MSEK", color=line_exact.get_color(), every=False, final=True, max_points=4)
     ax_top.margins(x=0.08, y=0.22)
-    ax_top.set_ylabel("Candidate value (million SEK/year)")
-    ax_top.set_title("LBBD candidate evaluation: relaxation values versus exact recourse", pad=12)
+    ax_top.set_ylabel("Objective (million SEK/year)")
+    ax_top.set_title("Exact certification of evaluated LBBD infrastructures", pad=12)
 
-    exact_values = exact.to_numpy(dtype=float)
-    for column, label in present:
-        if column == exact_col:
-            continue
-        diff = (_numeric(df[column]).to_numpy(dtype=float) - exact_values) / 1e3
-        line, = ax_bottom.plot(iteration, diff, marker="o", linewidth=1.8, label=f"{label} − exact objective")
-        _annotate_selected_points(ax_bottom, iteration, diff, lambda y: f"{y:+.1f} kSEK", color=line.get_color(), every=False)
-    ax_bottom.axhline(0, linewidth=1.0, color="0.25")
-    ax_bottom.margins(x=0.08, y=0.25)
+    positive_gap = fixed_gap.where(fixed_gap > 0)
+    if positive_gap.notna().any():
+        line_gap, = ax_bottom.semilogy(iteration, positive_gap, marker="o", linewidth=1.9, label="Fixed-layout exact MIP gap")
+        _annotate_selected_points(ax_bottom, iteration, positive_gap, lambda y: f"{y:.5f}%", color=line_gap.get_color(), every=False, final=True, max_points=4)
+    else:
+        ax_bottom.text(0.5, 0.5, "No positive fixed-layout certification gaps", transform=ax_bottom.transAxes, ha="center", va="center")
     ax_bottom.set_xlabel("LBBD iteration")
-    ax_bottom.set_ylabel("Difference from exact objective (kSEK/year)")
-    ax_bottom.set_title("Relaxation/certification error at each evaluated infrastructure")
+    ax_bottom.set_ylabel("Exact fixed-layout gap (%)")
+    ax_bottom.set_title("Exact certification precision for each evaluated infrastructure")
 
     handles1, labels1 = ax_top.get_legend_handles_labels()
     handles2, labels2 = ax_bottom.get_legend_handles_labels()
-    _boxed_legend_below(fig, handles1 + handles2, labels1 + labels2, ncol=2, bottom=0.28)
+    _boxed_legend_below(fig, handles1 + handles2, labels1 + labels2, ncol=2, bottom=0.27)
     return _save(fig, figures_dir, "19_lbbd_candidate_bounds", dpi)
 
 
-
-def _plot_lbbd_infrastructure_evolution(run_dir: Path, figures_dir: Path, dpi: int) -> list[str]:
+def _plot_lbbd_infrastructure_evolution(
+    run_dir: Path,
+    figures_dir: Path,
+    dpi: int,
+) -> list[str]:
     df = _load_lbbd_history(run_dir)
-    columns = [("slow", "Slow"), ("medium", "Medium"), ("fast", "Fast"), ("PV", "PV"), ("BESS", "BESS")]
-    present = [(column, label) for column, label in columns if column in df.columns]
-    if not present:
+
+    best_columns = {
+        "Slow": "best_slow",
+        "Medium": "best_medium",
+        "Fast": "best_fast",
+        "PV": "best_PV",
+        "BESS": "best_BESS",
+    }
+    legacy_columns = {
+        "Slow": "slow",
+        "Medium": "medium",
+        "Fast": "fast",
+        "PV": "PV",
+        "BESS": "BESS",
+    }
+
+    if all(column in df.columns for column in best_columns.values()):
+        columns = best_columns
+        title = "Best-certified LBBD infrastructure by iteration"
+    else:
+        columns = legacy_columns
+        title = "Evaluated LBBD infrastructure by iteration"
+
+    if not any(column in df.columns for column in columns.values()):
         raise ValueError("LBBD history lacks infrastructure counts")
-    iteration = _numeric(df["iteration"])
-    fig, ax = plt.subplots(figsize=(10.7, 6.2))
-    for column, label in present:
-        values = _numeric(df[column]).astype(float)
-        first_valid = values.dropna()
-        if first_valid.empty:
+
+    iteration = _numeric(df["iteration"]).to_numpy(dtype=float)
+
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=(14.0, 4.8),
+        sharex=True,
+    )
+
+    for label in ("Slow", "Medium", "Fast"):
+        column = columns[label]
+        if column not in df.columns:
             continue
-        base = float(first_valid.iloc[0])
-        if abs(base) > 1e-12:
-            indexed = 100.0 * (values / base - 1.0)
-            axis_label = "Change from first master candidate (%)"
-        else:
-            indexed = values
-            axis_label = "Installed units"
-        final = values.dropna().iloc[-1]
-        ax.plot(iteration, indexed, marker="o", linewidth=1.8, label=f"{label} (final {final:,.0f})")
-    ax.axhline(0, linewidth=0.8, color="0.25")
-    ax.set_xlabel("LBBD iteration")
-    ax.set_ylabel(axis_label)
-    ax.set_title("LBBD infrastructure-candidate evolution")
-    handles, labels = ax.get_legend_handles_labels()
-    _boxed_legend_below(fig, handles, labels, ncol=3, bottom=0.24)
-    return _save(fig, figures_dir, "20_lbbd_infrastructure_evolution", dpi)
+        values = _numeric(df[column]).ffill()
+        line, = axes[0].step(
+            iteration,
+            values,
+            where="post",
+            marker="o",
+            linewidth=1.8,
+            label=label,
+        )
+        valid = values.dropna()
+        if not valid.empty:
+            _annotate_xy(
+                axes[0],
+                float(iteration[-1]),
+                float(valid.iloc[-1]),
+                f"{int(round(valid.iloc[-1])):,}",
+                color=line.get_color(),
+                xytext=(0, 8),
+                fontsize=8,
+            )
+
+    axes[0].set_title("Public chargers")
+    axes[0].set_ylabel("Installed chargers")
+    axes[0].legend(frameon=True)
+
+    if columns["PV"] in df.columns:
+        values = _numeric(df[columns["PV"]]).ffill()
+        line, = axes[1].step(
+            iteration,
+            values,
+            where="post",
+            marker="o",
+            linewidth=1.8,
+        )
+        valid = values.dropna()
+        if not valid.empty:
+            _annotate_xy(
+                axes[1],
+                float(iteration[-1]),
+                float(valid.iloc[-1]),
+                f"{int(round(valid.iloc[-1])):,}",
+                color=line.get_color(),
+                xytext=(0, 8),
+                fontsize=8,
+            )
+
+    axes[1].set_title("Photovoltaic deployment")
+    axes[1].set_ylabel("Installed PV panels")
+
+    if columns["BESS"] in df.columns:
+        values = _numeric(df[columns["BESS"]]).ffill()
+        line, = axes[2].step(
+            iteration,
+            values,
+            where="post",
+            marker="o",
+            linewidth=1.8,
+        )
+        valid = values.dropna()
+        if not valid.empty:
+            _annotate_xy(
+                axes[2],
+                float(iteration[-1]),
+                float(valid.iloc[-1]),
+                f"{int(round(valid.iloc[-1])):,}",
+                color=line.get_color(),
+                xytext=(0, 8),
+                fontsize=8,
+            )
+
+    axes[2].set_title("Battery storage deployment")
+    axes[2].set_ylabel("Installed BESS units")
+
+    for ax in axes:
+        ax.set_xlabel("LBBD iteration")
+        ax.set_xticks(iteration)
+        ax.set_xticklabels([str(int(v)) for v in iteration])
+        ax.margins(x=0.07, y=0.16)
+
+    fig.suptitle(title, y=0.98)
+    fig.subplots_adjust(
+        left=0.07,
+        right=0.98,
+        bottom=0.16,
+        top=0.84,
+        wspace=0.30,
+    )
+
+    return _save(fig,figures_dir, "20_lbbd_infrastructure_evolution", dpi)
 
 
 def _plot_lbbd_iteration_timing(run_dir: Path, figures_dir: Path, dpi: int) -> list[str]:
@@ -1050,26 +1218,29 @@ def _plot_lbbd_iteration_timing(run_dir: Path, figures_dir: Path, dpi: int) -> l
 def _plot_lbbd_gap_diagnostics(run_dir: Path, figures_dir: Path, dpi: int) -> list[str]:
     df = _load_lbbd_history(run_dir)
     iteration = _numeric(df["iteration"])
+    master_col = "master_mip_gap" if "master_mip_gap" in df.columns else "master_internal_gap"
     series = [
-        ("lbbd_gap", "Certified global gap"),
-        ("master_internal_gap", "Master solve gap"),
-        ("candidate_fixed_gap", "Fixed-layout MIP gap"),
+        ("lbbd_gap", "Certified global LBBD gap"),
+        (master_col, "Achieved master MIP gap (incumbent solves only)"),
+        ("candidate_fixed_gap", "Fixed-layout exact MIP gap"),
     ]
     present = [(column, label) for column, label in series if column in df.columns and _numeric(df[column]).notna().any()]
     if not present:
         raise ValueError("LBBD history lacks gap diagnostics")
-    fig, ax = plt.subplots(figsize=(10.2, 6.1))
+    fig, ax = plt.subplots(figsize=(10.4, 6.2))
     for column, label in present:
         values = 100.0 * _numeric(df[column])
-        values = values.where(values > 0)
-        ax.semilogy(iteration, values, marker="o", linewidth=1.8, label=label)
+        if column == master_col and "master_gap_is_mip" in df.columns:
+            values = values.where(_numeric(df["master_gap_is_mip"]).fillna(0) > 0.5)
+        positive = values.where(values > 0)
+        if positive.notna().any():
+            ax.semilogy(iteration, positive, marker="o", linewidth=1.8, label=label)
     ax.set_xlabel("LBBD iteration")
     ax.set_ylabel("Gap (%) — logarithmic scale")
-    ax.set_title("LBBD global, master and fixed-layout gap diagnostics")
+    ax.set_title("Comparable LBBD optimality-gap diagnostics")
     handles, labels = ax.get_legend_handles_labels()
     _boxed_legend_below(fig, handles, labels, ncol=3, bottom=0.23)
     return _save(fig, figures_dir, "22_lbbd_gap_diagnostics", dpi)
-
 
 def _plot_lbbd_adaptive_master_control(run_dir: Path, figures_dir: Path, dpi: int) -> list[str]:
     df = _load_lbbd_history(run_dir)
@@ -1079,23 +1250,25 @@ def _plot_lbbd_adaptive_master_control(run_dir: Path, figures_dir: Path, dpi: in
     iteration = _numeric(df["iteration"])
     certified = 100.0 * _numeric(df["lbbd_gap"])
     requested = 100.0 * _numeric(df["master_gap_requested"])
+    master_col = "master_mip_gap" if "master_mip_gap" in df.columns else "master_internal_gap"
     master_actual = (
-        100.0 * _numeric(df["master_internal_gap"])
-        if "master_internal_gap" in df.columns else pd.Series(np.nan, index=df.index)
+        100.0 * _numeric(df[master_col])
+        if master_col in df.columns else pd.Series(np.nan, index=df.index)
     )
+    if "master_gap_is_mip" in df.columns:
+        master_actual = master_actual.where(_numeric(df["master_gap_is_mip"]).fillna(0) > 0.5)
 
     fig, ax = plt.subplots(figsize=(11.0, 6.7))
-    plotted = []
     for values, label, style in [
         (certified, "Certified LBBD gap", "-"),
-        (requested, "Requested trial-master gap", "--"),
-        (master_actual, "Achieved master gap", ":"),
+        (requested, "Requested master MIP gap", "--"),
+        (master_actual, "Achieved master MIP gap", ":"),
     ]:
         positive = values.where(values > 0)
         if positive.notna().any():
             line, = ax.semilogy(iteration, positive, marker="o", linewidth=1.9, linestyle=style, label=label)
-            plotted.append((line, positive, label))
-            _annotate_selected_points(ax, iteration, positive, lambda y: f"{y:.4f}%", color=line.get_color(), every=True, max_points=7)
+            _annotate_selected_points(ax, iteration, positive, lambda y: f"{y:.4f}%", color=line.get_color(), every=True, max_points=8)
+
     plotted_values = pd.concat([certified, requested, master_actual], axis=0).dropna()
     plotted_values = plotted_values[plotted_values > 0]
     if not plotted_values.empty:
@@ -1103,27 +1276,31 @@ def _plot_lbbd_adaptive_master_control(run_dir: Path, figures_dir: Path, dpi: in
     ax.margins(x=0.07)
     ax.set_xlabel("LBBD iteration")
     ax.set_ylabel("Gap (%) — logarithmic scale")
-    ax.set_title("Adaptive LBBD master-gap control", pad=12)
+    ax.set_title("Adaptive LBBD master control (comparable MIP gaps only)", pad=12)
 
     handles, labels = ax.get_legend_handles_labels()
+    if "candidate_source" in df.columns:
+        # Mark non-MIP candidate-generation iterations without assigning them a fake
+        # master MIP gap.  They are algorithmic events, not failed convergence points.
+        sources = df["candidate_source"].astype(str)
+        non_mip = ~sources.eq("master_mip_incumbent")
+        if non_mip.any() and not plotted_values.empty:
+            y_marker = float(plotted_values.max()) * 1.35
+            xs = iteration[non_mip]
+            ax.scatter(xs, [y_marker] * len(xs), marker="x", label="Bootstrap/fallback/bound-only iteration")
+            handles, labels = ax.get_legend_handles_labels()
+
     if "candidate_repeat_count" in df.columns:
         ax2 = ax.twinx()
         repeats = _numeric(df["candidate_repeat_count"]).fillna(0.0)
-        repeat_line, = ax2.step(
-            iteration, repeats, where="mid", linewidth=1.6,
-            label="Consecutive repeated candidate count",
-        )
+        repeat_line, = ax2.step(iteration, repeats, where="mid", linewidth=1.6, label="Consecutive repeated candidate count")
         ax2.set_ylabel("Repeated-candidate count")
         ax2.set_ylim(0, max(1.0, 1.20 * float(repeats.max())))
         ax2.grid(False)
-        if float(repeats.max()) > 0:
-            _annotate_selected_points(ax2, iteration, repeats, lambda y: f"repeat {int(y)}", color=repeat_line.get_color(), every=True)
         handles.append(repeat_line)
         labels.append("Consecutive repeated candidate count")
     _boxed_legend_below(fig, handles, labels, ncol=2, bottom=0.27)
     return _save(fig, figures_dir, "23_lbbd_adaptive_master_control", dpi)
-
-
 
 def _plot_lbbd_candidate_reuse(run_dir: Path, figures_dir: Path, dpi: int) -> list[str]:
     df = _load_lbbd_history(run_dir)
@@ -1415,24 +1592,25 @@ which figure groups were generated, skipped, or failed.
 - `09_decomposition_convergence.png` is the main certificate plot. The upper-bound line is the valid
   global master bound. The lower-bound line is the best exact feasible incumbent. The dashed gap line
   is `(UB - LB) / max(1, |UB|)` in percent.
-- `17_decomposition_cut_generation.png` reports accepted master cuts and, for LBBD runs, the annual-LP
-  and core-point violation signals before filtering. If it shows only exact-configuration cuts, this means
-  the embedded master relaxation was already tight enough that LP/core/logic cuts were not violated at
-  the evaluated candidates.
-- `18_lbbd_cut_families.png` summarizes the accepted LBBD cuts by family and by iteration. It is a
-  diagnostic of which inference mechanism actually changed the master, not a measure of solution quality.
-- `19_lbbd_candidate_bounds.png` compares the master candidate value, annual LP relaxation, fixed-layout
-  MIP upper bound, and exact feasible objective. The lower panel reports differences from the exact
-  incumbent in kSEK/year, which is usually more informative than overlapping objective lines.
-- `20_lbbd_infrastructure_evolution.png` shows how the candidate charger, PV, and BESS decisions change
-  across iterations.
-- `21_lbbd_iteration_timing.png` separates master-solve time from oracle/cut/export time and shows the
-  cumulative runtime.
-- `22_lbbd_gap_diagnostics.png` compares the global LBBD gap, master MIP gap, and exact fixed-layout MIP
-  gap on a logarithmic scale.
-- `23_lbbd_adaptive_master_control.png` verifies that the requested trial-master gap tightens as the
-  certified LBBD gap decreases. This is important because a loose trial-master MIP gap can stall outer-loop
+
+- `17_decomposition_cut_generation.png` shows cuts accepted in each decomposition iteration and the cumulative enrichment of the master.
+  For LBBD, accepted cuts are stacked by cut family.
+
+- `18_lbbd_cut_families.png` summarizes the LBBD cut families that actually contributed constraints to the master.
+
+- `19_lbbd_candidate_bounds.png` shows exact candidate profit, fixed-infrastructure upper bounds, the best certified incumbent,
+  and exact fixed-infrastructure certification gaps.
+
+- `20_lbbd_infrastructure_evolution.png` shows the actual charger, photovoltaic-panel, and battery-unit counts of the best certified
+  infrastructure across LBBD iterations.
+
+- `21_lbbd_iteration_timing.png` separates master-solve time from oracle/cut/export time and shows the cumulative runtime.
+
+- `22_lbbd_gap_diagnostics.png` compares the global LBBD gap, master MIP gap, and exact fixed-layout MIP gap on a logarithmic scale.
+
+- `23_lbbd_adaptive_master_control.png` verifies that the requested trial-master gap tightens as the certified LBBD gap decreases. This is important because a loose trial-master MIP gap can stall outer-loop
   convergence.
+  
 - `24_lbbd_candidate_reuse.png` shows whether an iteration evaluated a new infrastructure candidate or
   reused an exact result from the internal cache, together with repeated-candidate counts and new cuts.
 

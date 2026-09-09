@@ -1,0 +1,10 @@
+check,value
+max_energy_balance_abs_kWh,2.2737367544323206e-12
+max_aggregate_outflow_abs_kWh,8.881784197001252e-13
+max_aggregate_inflow_abs_kWh,9.166001291305292e-13
+max_trip_decomposition_abs_kWh,1.9895196601282805e-13
+max_home_demand_cover_abs_kWh,1.4210854715202004e-14
+max_public_demand_cover_abs_kWh,1.1009859690602752e-11
+max_q_origin_allocation_abs_kWh,1.1009859690602752e-11
+max_soc_dynamics_abs_kWh,2.6334490144108713e-12
+annual_slack_kWh,0.0

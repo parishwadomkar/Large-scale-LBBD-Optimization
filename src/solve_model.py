@@ -6,7 +6,13 @@ from pyomo.environ import SolverFactory
 
 def solve_model(model, solver_cfg: dict, run_dir: Path):
     log_dir = run_dir / "logs"
-    node_dir = run_dir / "nodefiles"
+    configured_node_dir = solver_cfg.get("nodefile_dir")
+    if configured_node_dir:
+        node_dir = Path(str(configured_node_dir)).expanduser()
+        if not node_dir.is_absolute():
+            node_dir = (Path.cwd() / node_dir).resolve()
+    else:
+        node_dir = run_dir / "nodefiles"
     log_dir.mkdir(parents=True, exist_ok=True)
     node_dir.mkdir(parents=True, exist_ok=True)
 
@@ -37,7 +43,7 @@ def solve_model(model, solver_cfg: dict, run_dir: Path):
             opt.options[str(name)] = value
 
     opt.options["LogFile"] = str((log_dir / "gurobi_run.log").resolve()).replace("\\", "/")
-    opt.options["NodefileDir"] = str(node_dir.resolve())
+    opt.options["NodefileDir"] = str(node_dir.resolve()).replace("\\", "/")
 
     kwargs = {
         "tee": bool(solver_cfg.get("tee", True)),

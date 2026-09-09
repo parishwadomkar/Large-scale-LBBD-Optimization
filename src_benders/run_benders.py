@@ -75,6 +75,7 @@ def parse_args():
     p.add_argument("--root-method", choices=["auto", "primal", "dual", "barrier", "concurrent", "deterministic-concurrent"], default=None)
     p.add_argument("--node-method", choices=["auto", "primal", "dual", "barrier"], default=None)
     p.add_argument("--nodefile-start", type=float, default=None)
+    p.add_argument("--nodefile-dir", default=None, help="Optional directory for Gurobi branch-and-bound node files.")
     p.add_argument("--soft-mem-limit-gb", type=float, default=None)
     p.add_argument("--pre-sparsify", type=int, choices=[-1, 0, 1, 2], default=None)
     p.add_argument("--aggregate", type=int, choices=[-1, 0, 1, 2], default=None)
@@ -336,6 +337,8 @@ def main():
         solver_cfg["node_method"] = node_method_map[args.node_method]
     if args.nodefile_start is not None:
         solver_cfg["nodefile_start_gb"] = float(args.nodefile_start)
+    if args.nodefile_dir is not None:
+        solver_cfg["nodefile_dir"] = str(args.nodefile_dir)
     if args.soft_mem_limit_gb is not None:
         solver_cfg["soft_mem_limit_gb"] = float(args.soft_mem_limit_gb)
     if args.pre_sparsify is not None:
@@ -399,6 +402,7 @@ def main():
             "root_method": args.root_method,
             "node_method": args.node_method,
             "nodefile_start_gb": solver_cfg.get("nodefile_start_gb"),
+            "nodefile_dir": solver_cfg.get("nodefile_dir"),
             "soft_mem_limit_gb": solver_cfg.get("soft_mem_limit_gb"),
             "pre_sparsify": solver_cfg.get("pre_sparsify"),
             "aggregate": solver_cfg.get("aggregate"),
@@ -474,6 +478,10 @@ def main():
             extra_scalars={
                 "master_mip_gap_requested": float(args.master_gap),
                 "certified_benders_gap_requested": float(args.benders_gap),
+                "solver_threads_requested": solver_cfg.get("threads"),
+                "nodefile_start_gb": solver_cfg.get("nodefile_start_gb"),
+                "nodefile_dir": solver_cfg.get("nodefile_dir"),
+                "soft_mem_limit_gb": solver_cfg.get("soft_mem_limit_gb"),
                 "slot_lp_calls": int(len(out["sp"])) if args.scenario == "with_redirection" else 0,
                 "slot_lp_max_variables": float(pd.to_numeric(out["sp"].get("n_vars"), errors="coerce").max()) if args.scenario == "with_redirection" and not out["sp"].empty and "n_vars" in out["sp"] else 0,
                 "slot_lp_max_arcs": float(pd.to_numeric(out["sp"].get("n_arcs"), errors="coerce").max()) if args.scenario == "with_redirection" and not out["sp"].empty and "n_arcs" in out["sp"] else 0,
