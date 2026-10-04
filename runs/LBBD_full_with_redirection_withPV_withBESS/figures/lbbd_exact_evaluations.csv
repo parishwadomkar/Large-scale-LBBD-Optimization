@@ -1,0 +1,5 @@
+iteration,exact_call_id,stage,objective_SEK,fixed_upper_bound_SEK,solver_seconds,work_units,log_name
+1,1,trial,501590834.2573,501590953.1494,22044.07,33499.39,lbbd_exact_annual_001.log
+2,2,trial,503687248.5608,503687532.2378,663.53,591.28,lbbd_exact_annual_002.log
+3,3,trial,-401921419.6956,-401919278.6993,1264.21,1210.12,lbbd_exact_annual_003.log
+3,301,repair,501607871.3127,501608001.8745,1123.72,1070.34,lbbd_exact_annual_301.log

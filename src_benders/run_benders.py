@@ -23,7 +23,7 @@ if str(PROJECT_ROOT / "src") not in sys.path:
 
 from src.data_loader import load_inputs
 from src.preprocessing import preprocess
-from src.solve_model import solve_model
+from src.solve_model import solve_model, solver_certificate
 from src.utils import ensure_dir, load_json, resolve_project_path
 from src_benders.benders_master import build_benders_master, apply_hard_no_slack
 from src_benders.benders_export import export_all, print_summary
@@ -62,6 +62,8 @@ def parse_args():
     p.add_argument("--benders-gap", type=float, default=None)
     p.add_argument("--max-iterations", type=int, default=None)
     p.add_argument("--time-limit", type=int, default=None)
+    p.add_argument("--overall-time-limit", type=int, default=None,
+                   help="Overall wall-clock budget in seconds, including all master and slot LP solves.")
     p.add_argument("--disable-pv", action="store_true")
     p.add_argument("--disable-bess", action="store_true")
     p.add_argument("--hard-no-slack", action="store_true")
@@ -192,12 +194,10 @@ def solve_master(model, solver_cfg, run_dir: Path, iteration: int):
     res = solve_model(model, solver_cfg_iter, run_dir)
     if old_log.exists():
         log_path.write_text(old_log.read_text(encoding="utf-8", errors="replace"), encoding="utf-8", errors="replace")
-    inc, bound, mip_gap = parse_gurobi_final_bound(log_path)
-    if inc is None:
-        inc = float(pyo.value(model.obj))
-    if bound is None:
-        bound = inc
-    return res, inc, bound, mip_gap
+    certificate = solver_certificate(res, model, log_path)
+    inc = certificate["objective_SEK"]
+    bound = certificate["valid_bound_SEK"]
+    return res, inc, (float(bound) if bound is not None else float("inf")), certificate["gurobi_mip_gap"]
 
 
 def run_benders_loop(model, data, solver_cfg, run_dir: Path, args):
@@ -212,13 +212,33 @@ def run_benders_loop(model, data, solver_cfg, run_dir: Path, args):
         cut_strategy = "corepoint"
     core_interface = None
     converged = False
+    termination = "max_iterations"
     for it in range(1, int(args.max_iterations) + 1):
+        deadline = getattr(args, "_overall_deadline", math.inf)
+        remaining = deadline - time.perf_counter()
+        if remaining <= 60:
+            termination = "overall_time_limit"
+            break
         print(f"\n========== Benders ITERATION {it} ==========")
-        res, master_incumbent, master_bound, master_mip_gap = solve_master(model, solver_cfg, run_dir, it)
-        global_ub = min(global_ub, master_bound)
+        solver_cfg_iter = dict(solver_cfg)
+        solver_cfg_iter["time_limit_seconds"] = max(1, min(int(solver_cfg["time_limit_seconds"]), int(remaining - 60)))
+        res, master_incumbent, master_bound, master_mip_gap = solve_master(model, solver_cfg_iter, run_dir, it)
+        if math.isfinite(master_bound):
+            global_ub = min(global_ub, master_bound)
         term = str(res.solver.termination_condition).lower()
-        if not ("optimal" in term or "time" in term):
-            raise RuntimeError(f"Master failed: {res.solver.status} {res.solver.termination_condition}")
+        if master_incumbent is None:
+            termination = "master_no_incumbent_" + term
+            history.append({"iteration": it, "method": "Benders", "status": termination,
+                            "elapsed_seconds": time.perf_counter() - getattr(args, "_overall_started", time.perf_counter()),
+                            "master_best_bound_UB_SEK": master_bound,
+                            "global_best_UB_SEK": global_ub,
+                            "best_LB_SEK": best_lb if math.isfinite(best_lb) else None,
+                            "Benders_gap": finite_gap(global_ub, best_lb)})
+            print(f"Master {it} stopped without a loaded incumbent; retained bound={master_bound:,.3f} and prior certified LB={best_lb:,.3f}.")
+            break
+        if "error" in str(res.solver.status).lower():
+            termination = "solver_error_with_previous_incumbent"
+            break
         interface = extract_interface(model, data)
         master_obj = float(pyo.value(model.obj))
         theta_total = sum(interface["theta"].values())
@@ -228,8 +248,13 @@ def run_benders_loop(model, data, solver_cfg, run_dir: Path, args):
         cut_candidates = []
         iter_flows = []
         bad_slots = 0
+        deadline_reached = False
         for mon in data["MONTHS"]:
             for t in data["INTERVALS"]:
+                if time.perf_counter() >= deadline - 60:
+                    deadline_reached = True
+                    bad_slots += 1
+                    break
                 outg = sum(interface["G"].get((int(i), int(j), mon, int(t)), 0.0) for (i, j, m2, t2) in data["allowed_st"] if m2 == mon and int(t2) == int(t))
                 if outg <= 1e-8:
                     sp_rows.append({"iteration": it, "Month": mon, "TimeIndex": int(t), "objective_SEK": 0.0, "theta_SEK": interface["theta"].get((mon, int(t)), 0.0), "violation_SEK": 0.0, "positive_rows": 0, "n_arcs": 0, "n_vars": 0, "status": "ok", "termination": "empty_zero_redirection"})
@@ -249,6 +274,8 @@ def run_benders_loop(model, data, solver_cfg, run_dir: Path, args):
                 if sp.violation > cut_tol:
                     max_viol = max(max_viol, sp.violation)
                     cut_candidates.append(sp)
+            if deadline_reached:
+                break
         selected_cuts = select_cut_candidates(cut_candidates, getattr(args, "max_cuts_per_iteration", None), cut_tol)
         for sp in selected_cuts:
             nz = add_type_assignment_cut(model, sp)
@@ -277,6 +304,7 @@ def run_benders_loop(model, data, solver_cfg, run_dir: Path, args):
         gap = finite_gap(global_ub, best_lb)
         row = {
             "iteration": it, "method": "Benders",
+            "elapsed_seconds": time.perf_counter() - getattr(args, "_overall_started", time.perf_counter()),
             "master_incumbent_SEK": master_incumbent,
             "master_best_bound_UB_SEK": master_bound,
             "global_best_UB_SEK": global_ub,
@@ -300,6 +328,14 @@ def run_benders_loop(model, data, solver_cfg, run_dir: Path, args):
         gc.collect()
         if bad_slots == 0 and gap <= float(args.benders_gap):
             converged = True
+            termination = "certified_gap"
+            break
+        if bad_slots > 0 and cuts_added == 0 and not deadline_reached:
+            termination = "infeasible_type_assignment_without_feasibility_cut"
+            print("Benders has an infeasible type-assignment interface and no feasibility cut; certification cannot continue.")
+            break
+        if deadline_reached:
+            termination = "overall_time_limit"
             break
     hist = pd.DataFrame(history)
     sp = pd.DataFrame(sp_rows)
@@ -309,7 +345,9 @@ def run_benders_loop(model, data, solver_cfg, run_dir: Path, args):
     cuts.to_csv(run_dir / "iterations" / "type_assignment_cuts.csv", index=False)
     if best_snapshot is not None:
         restore_vars(model, best_snapshot)
-    return {"converged": converged, "history": hist, "sp": sp, "cuts": cuts, "best_rows": best_rows, "best_lb": best_lb, "best_snapshot_restored": best_snapshot is not None}
+    return {"converged": converged, "termination": termination, "global_ub": global_ub,
+            "history": hist, "sp": sp, "cuts": cuts, "best_rows": best_rows,
+            "best_lb": best_lb, "best_snapshot_restored": best_snapshot is not None}
 
 
 def main():
@@ -317,6 +355,8 @@ def main():
     monitor = ResourceMonitor().start()
     phase_timing: dict[str, float] = {}
     args = parse_args()
+    args._overall_started = total_started
+    args._overall_deadline = (time.perf_counter() + float(args.overall_time_limit)) if args.overall_time_limit else math.inf
     root = Path(args.project_root).resolve()
     paths, cfg, solver_cfg = load_configs(root, args.dataset)
     apply_profile_defaults(args, load_run_profile(root, "benders", args.dataset))
@@ -416,6 +456,22 @@ def main():
             phase_started = time.perf_counter()
             out = run_benders_loop(model, data, solver_cfg, run_dir, args)
             phase_timing["decomposition_solve_seconds"] = time.perf_counter() - phase_started
+            (run_dir / "run_metadata.json").write_text(json.dumps({
+                "method": "Benders", "dataset": args.dataset, "scenario": args.scenario,
+                "termination": out["termination"], "converged": out["converged"],
+                "best_lb_SEK": out["best_lb"] if math.isfinite(out["best_lb"]) else None,
+                "global_ub_SEK": out["global_ub"] if math.isfinite(out["global_ub"]) else None,
+                "certified_gap": finite_gap(out["global_ub"], out["best_lb"])
+                    if math.isfinite(out["global_ub"]) and math.isfinite(out["best_lb"]) else None,
+            }, indent=2), encoding="utf-8")
+            if not out["best_snapshot_restored"]:
+                print("No certified original-problem incumbent; solver bounds and logs remain available.")
+                monitor.stop()
+                phase_timing["total_runtime_seconds"] = time.perf_counter() - total_started
+                write_run_complexity(run_dir, "Benders", data, phase_timing=phase_timing,
+                                     model_stats={"master": main_model_stats}, resource_monitor=monitor,
+                                     extra_scalars={"termination_reason": out["termination"]})
+                return 2
             print_summary(model, data, cfg)
             phase_started = time.perf_counter()
             export_all(model, data, cfg, run_dir, type_rows=out["best_rows"], history=out["history"], sp_summary=out["sp"], cut_records=out["cuts"], certified_lb=out["best_lb"])
@@ -443,15 +499,18 @@ def main():
             phase_timing["solve_seconds"] = time.perf_counter() - phase_started
             print(res.solver)
             term = str(res.solver.termination_condition).lower()
-            if "infeasible" in term:
-                print("Model infeasible. Inspect solver log and slack/hard-no-slack settings.")
+            cert = solver_certificate(res, model, run_dir / "logs" / "gurobi_run.log")
+            (run_dir / "results" / "solver_certificate.json").write_text(json.dumps(cert, indent=2), encoding="utf-8")
+            if not cert["has_loaded_incumbent"]:
+                print("No feasible incumbent available; solver status/bounds were retained.")
                 return 2
             print_summary(model, data, cfg)
             phase_started = time.perf_counter()
             export_all(model, data, cfg, run_dir)
             phase_timing["export_seconds"] = time.perf_counter() - phase_started
             obj_val = pyo.value(model.obj)
-            rows = [{"iteration": 1, "method": "Benders_no_redirection_validation", "master_obj_SEK": obj_val, "best_LB_SEK": obj_val, "global_best_UB_SEK": obj_val, "Benders_gap": 0.0, "cuts_added": 0, "bad_slots": 0, "note": "No-redirection validation: redirection variables fixed to zero"}]
+            upper = cert["valid_bound_SEK"]
+            rows = [{"iteration": 1, "method": "Benders_no_redirection_validation", "master_obj_SEK": obj_val, "best_LB_SEK": obj_val, "global_best_UB_SEK": upper, "Benders_gap": finite_gap(upper, obj_val) if upper is not None else math.nan, "cuts_added": 0, "bad_slots": 0, "note": "No-redirection validation: redirection variables fixed to zero"}]
             pd.DataFrame(rows).to_csv(run_dir / "iterations" / "benders_iteration_history.csv", index=False)
             phase_started = time.perf_counter()
             if not args.skip_figures:

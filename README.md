@@ -2,7 +2,7 @@
 
 ## PV- and BESS-enabled public EV charging with user redirection
 
-This repository provides a Pyomo/Gurobi optimization framework for strategic planning of public electric vehicle (EV) charging infrastructure, with on-site photovoltaic (PV) generation, battery energy storage systems (BESS), and short-range user redirection. The optimization is formulated from the perspective of a charging point operator (CPO) and maximizes annual net profit subject to spatiotemporal charging demand, charger-capacity limits, land-use limits, energy-balance constraints, and redirection feasibility.
+This repository provides an optimization framework for strategic planning of public electric vehicle (EV) charging infrastructure, with on-site photovoltaic (PV) generation, battery energy storage systems (BESS), and short range user redirection. The optimization is formulated (Pyomo/Gurobi) from the perspective of a charging point operator (CPO) and maximizes annual net profit subject to spatiotemporal charging demand, charger capacity limits, landuse limits, energy balance constraints, and redirection feasibility.
 
 Charging demand is generated externally using the MATSim-based simulation framework [`UrbanEV-v2`](https://github.com/parishwadomkar/UrbanEV-v2) and aggregated to spatial planning cells, representative month-days, and half-hour time intervals.
 
@@ -16,9 +16,9 @@ Charging demand is generated externally using the MATSim-based simulation framew
 
 ## Model scope
 
-The framework represents public charger deployment by charger type, PV and BESS sizing, grid procurement, PV self-consumption, BESS charging/discharging, linked representative-month state-of-charge dynamics, local service of residual home demand, type-aware public-demand redirection, redirection incentives, charger-type tariff compensation, annualized investment costs, and unmet-demand slack diagnostics.
+The framework represents public charger deployment by charger type, PV and BESS sizing, grid procurement, PV self-consumption, BESS charging/discharging, annually linked representative-month state-of-charge (SoC) dynamics, local service of residual home demand, type-aware public demand redirection, redirection incentives, charger-type tariff compensation, annualized investment costs, and penalized unmet demand slack.
 
-The model is intended for strategic city-scale planning. It does not model private home-charger investment, upstream grid reinforcement, parcel-level permitting, or real-time heterogeneous user-acceptance behavior.
+The model is intended for strategic city scale planning. It does not model private home charger investment, upstream grid reinforcement, parcel level permitting, or real time heterogeneous user acceptance behavior.
 
 <p align="center">
   <img src="./assets/LBBD.png" alt="Logic-Based Benders Decomposition workflow" width="70%">
@@ -32,36 +32,38 @@ The model is intended for strategic city-scale planning. It does not model priva
 
 | Workflow | Entry point | Intended use |
 |---|---|---|
-| Monolithic MILP | `src/run_optimization.py` | Benchmark validation and small-instance scenario checks. |
-| Benders | `src_benders/run_benders.py` | Arc-witness Benders implementation for comparison and decomposition diagnostics. |
-| LBBD | `src_lbbd/run_lbbd.py` | Recommended decomposition workflow for larger redirection-enabled instances. |
+| Monolithic MILP | `src/run_optimization.py` | Reference formulation; small and full benchmark runs. |
+| Benders | `src_benders/run_benders.py` | Arc-witness decomposition and comparison runs. |
+| LBBD | `src_lbbd/run_lbbd.py` | Decomposition with exact annual recourse certification. |
 
-Run settings are read from `config/model_config.json`, `config/solver_gurobi.json`, `config/run_profiles.json`, and `config/paths.json`. Command-line options override profile values when supplied. Scenario batch files are available in `scripts/`, `scripts_benders/`, and `scripts_lbbd/`.
+Run settings are read from `config/model_config.json`, `config/solver_gurobi.json`, `config/run_profiles.json`, and `config/paths.json`; supplied command-line options override profile values.
+The method-specific scripts remain in `scripts/`, `scripts_benders/`, and `scripts_lbbd/`.
 
 ---
 
 ## Input data
 
-The input data is publicly available in the [`data/`](https://github.com/parishwadomkar/Large-scale-LBBD-Optimization/tree/main/data) directory.
-A typical `config/paths.json` points to the small and full datasets under `data/raw/small/` and `data/raw/full/`:
+The configured inputs are in [`data/`](data/). `config/paths.json` selects `data/small/` or `data/full/` and references:
 
 ```text
-demandHexGrid_optimization*.gpkg
-CharPark*.shp
-shortestpath*.csv
-spot_prices*.csv
-pvgis*.csv
+data/{small,full}/demandHexGrid*.gpkg
+data/{small,full}/CharPark*.shp
+data/{small,full}/shortestpath.csv
+data/ElPrice.csv
+data/PVGISdata.xlsx
 ```
 
-The demand file provides aggregated charging demand by cell, month, time interval, and charging context. Parking and land-use files define installation bounds. Shortest-path files define eligible redirection arcs. Spot-price and PVGIS files provide electricity-price and solar-generation inputs.
+The demand files aggregate charging events by cell, month, half-hour slot, and charging context. Parking and land-use files define installation bounds, and the shortest-path files define eligible redirection arcs. The price and PVGIS files provide electricity and solar inputs. Several geospatial files and the PVGIS workbook use Git LFS; retrieve their actual contents before running.
 
 ---
 
 ## Installation
 
-Install the Python packages:
+Install Git LFS, retrieve the data, and install the Python packages:
 
 ```powershell
+git lfs install
+git lfs pull
 conda install -c conda-forge geopandas pyogrio shapely pyproj fiona
 python -m pip install -r requirements_opti.txt
 ```
@@ -81,28 +83,28 @@ Run all commands from the project root.
 Small monolithic benchmark:
 
 ```powershell
-python src\run_optimization.py --dataset small --scenario with_redirection --threads 12 --mip-gap 0.0001
+python src\run_optimization.py --dataset small --scenario with_redirection --threads 10 --mip-gap 0.0001
 ```
 
 Small Benders run:
 
 ```powershell
-python src_benders\run_benders.py --dataset small --scenario with_redirection --threads 12 --mip-gap 0.0001
+python src_benders\run_benders.py --dataset small --scenario with_redirection --threads 10 --master-gap 0.0001 --benders-gap 0.0001
 ```
 The implemented Benders decomposition workflow is explained in [`src_benders/README.md`](https://github.com/parishwadomkar/Large-scale-LBBD-Optimization/blob/main/src_benders/README.md).
 
 Small LBBD run:
 
 ```powershell
-python src_lbbd\run_lbbd.py --dataset small --scenario with_redirection --threads 12 --mip-gap 0.0001
+python src_lbbd\run_lbbd.py --dataset small --scenario with_redirection --threads 10 --master-gap 0.0001 --subproblem-gap 0.00001 --lbbd-gap 0.0001
 ```
 
-Full LBBD run (memory-stable workstation/HPC profile):
+Full cold-start LBBD example (the detailed command and settings are in [`runs/terminal.txt`](runs/terminal.txt)):
 
 ```powershell
-python src_lbbd\run_lbbd.py --dataset full --scenario with_redirection --threads 10 --soft-mem-limit-gb 180 --nodefile-start 0.5 --nodefile-dir "runs\gurobi_nodefiles"
+python src_lbbd\run_lbbd.py --dataset full --scenario with_redirection --threads 10 --subproblem-threads 2 --lbbd-gap 0.0002 --subproblem-gap 0.00001 --max-iterations 16 --time-limit 1728000 --soft-mem-limit-gb 180 --nodefile-start 0.5 --nodefile-dir "runs\gurobi_nodefiles" --bound-polish
 ```
-The run outputs for the [monolithic](https://github.com/parishwadomkar/Large-scale-LBBD-Optimization/tree/main/runs/2026-08-12_093933_small_with_redirection_withPV_withBESS_slackpenalty), [Benders](https://github.com/parishwadomkar/Large-scale-LBBD-Optimization/tree/main/runs/2026-08-12_095839_small_with_redirection_Benders_withPV_withBESS), and [LBBD](https://github.com/parishwadomkar/Large-scale-LBBD-Optimization/tree/main/runs/2026-08-12_184349_small_with_redirection_LBBD_withPV_withBESS) workflows are available in the [`runs/`](https://github.com/parishwadomkar/Large-scale-LBBD-Optimization/tree/main/runs) directory.
+Selected small and full results are available under [`runs/`](runs/). Full models can take days and may stop at a resource limit with a valid incumbent and bound. A command specifies a target, not a guaranteed certificate.
 
 
 Three-way comparison after the runs finish:
@@ -110,7 +112,7 @@ Three-way comparison after the runs finish:
 ```powershell
 python src\compare_runs.py --monolithic-run "runs\<MONOLITHIC_RUN_FOLDER>" --benders-run "runs\<BENDERS_RUN_FOLDER>" --lbbd-run "runs\<LBBD_RUN_FOLDER>"
 ```
-The results from the three implemented methods are comparable and can be validated using the [`monolithic_benders_lbbd_comparison.xlsx`](https://github.com/parishwadomkar/Large-scale-LBBD-Optimization/blob/main/runs/comparisons/2026-08-12_210707_monolithic_benders_lbbd_comparison.xlsx) workbook.
+Compare only matching dataset, scenario, technology, and resource settings; the [small comparison workbook](runs/comparisons/Small_monolithic_benders_lbbd_comparison.xlsx) is an example of a run comparison.
 
 Same-method comparison across different scenarios:
 
@@ -130,7 +132,7 @@ python src\compare_scenarios.py `
   --baseline-index 1
 ```
 
-The same-method comparison writes a formatted workbook under `runs/comparisons/` containing scenario summaries, changes relative to the baseline, redirection effects, scenario ranking, computational summaries, run metadata, raw metrics, and consistency checks. It is independent of `compare_runs.py`, which remains the comparator for monolithic–Benders–LBBD runs.
+The same method comparison writes a formatted workbook under `runs/comparisons/` containing scenario summaries, changes relative to the baseline, redirection effects, scenario ranking, computational summaries, run metadata, raw metrics, and consistency checks. It is independent of `compare_runs.py`, which remains the comparator for monolithic–Benders–LBBD runs.
 
 
 Common scenario and technology switches:
@@ -141,22 +143,20 @@ Common scenario and technology switches:
 | `--scenario` | `no_redirection`, `with_redirection` | Enables or disables spatial user redirection. |
 | `--disable-pv` | flag | Removes PV investment and dispatch. |
 | `--disable-bess` | flag | Removes BESS investment, dispatch, and SoC dynamics. |
-| `--threads` | integer | Sets the Gurobi thread count. Conservative values are recommended for memory-intensive full-data runs. |
-| `--mip-gap` | float | Convenience override for the exact annual MIP gap and certified LBBD gap. For full LBBD runs, the separate controls below are preferred. |
-| `--master-gap` | float | Trial-master MIP gap used by LBBD. |
-| `--master-gap-tight` | float | Tighter trial-master gap used automatically near convergence or after repeated candidates. |
-| `--lbbd-gap` | float | Final certified outer LBBD gap target. For example, `0.02` means 2%. |
-| `--subproblem-gap` | float | Exact annual operational-recourse MIP gap. |
-| `--logic-mip-gap` | float | Gap used for exact monthly logic-MIP inference. |
-| `--first-master-solution-limit` | integer | Optional iteration-1 feasibility bootstrap; `1` stops the first master after its first feasible integer solution and enables Gurobi's additional feasible-point search behavior. |
-| `--master-heuristic-time` | seconds | Time allocated to the iteration-1 Gurobi NoRel feasibility heuristic. |
-| `--soft-mem-limit-gb` | GB | Gurobi soft memory limit; the solver terminates gracefully rather than forcing a hard out-of-memory crash when possible. |
+| `--threads` | integer | Sets Gurobi threads; full-data memory use depends on the method and machine. |
+| `--mip-gap` | float | Monolithic MIP target; convenience override for Benders and LBBD targets. Use method-specific controls for full decomposition runs. |
+| `--master-gap`, `--master-gap-tight` | float | LBBD trial-master MIP tolerances; distinct from its final certificate. |
+| `--lbbd-gap` | float | LBBD global-bound target; `0.0002` means 0.020%. |
+| `--subproblem-gap` | float | LBBD exact annual recourse MIP tolerance. |
+| `--first-master-lp-bootstrap` | flag | Builds an internal investment candidate from the first master LP; exact MIP certification is still required. |
+| `--bound-polish` | flag | Switches later LBBD master solves toward bound improvement at the configured trigger. |
+| `--soft-mem-limit-gb` | GB | Gurobi soft memory limit; leave RAM for Python and the operating system. |
 | `--nodefile-start` | GB | Threshold for writing branch-and-bound node data to disk. |
 | `--nodefile-dir` | path | Directory used for Gurobi node files; a fast local SSD is recommended. |
-| `--time-limit` | seconds | Sets the overall run time limit. |
+| `--time-limit` | seconds | Monolithic solve limit or LBBD overall limit; Benders also accepts `--overall-time-limit`. |
 | `--skip-figures` | flag | Disables automatic figure generation. |
 
-Common scenario modifiers:
+Available scenario modifiers:
 
 | Scenario | Command modifier |
 |---|---|
@@ -177,36 +177,34 @@ Each run writes a timestamped folder under `runs/`. The main outputs are stored 
 
 | File | Contents |
 |---|---|
-| `README_RUN.txt` | Terminal transcript and run metadata. |
-| `results/model_summary.csv` | Economic, infrastructure, energy, redirection, and capacity metrics. |
-| `results/run_summary.csv` | Run-level objective, status, technology switches, and solver-gap information. |
-| `results/quality_checks.csv` | Automated feasibility and consistency checks. |
-| `results/infrastructure_by_hex.csv` | Cell-level charger, PV, BESS, footprint, and capacity outputs. |
+| `README_RUN.txt` | Terminal transcript for that run. |
+| `results/model_summary.csv` | Economic, infrastructure, energy, redirection, and capacity metrics for an exported incumbent. |
+| `run_metadata.json` / `results/solver_certificate.json` | Method-specific termination and bound records, when emitted. |
+| `results/infrastructure_by_hex.csv` | Cell-level charger, PV, BESS, charger-resource use, and capacity outputs. |
 | `results/energy_by_charger_type.csv` | Annual energy and utilization by charger type. |
-| `results/hourly_energy.csv` | Cell-month-slot grid, PV, BESS, service, and redirection values. |
+| `results/hourly_energy.csv` | Cell-month-slot grid, PV, BESS, service, and redirection values when exported. |
 | `results/redirections.csv` | Redirected energy by origin, destination, month, and time interval. |
 | `results/redirections_by_type.csv` | Type-aware origin/destination charger-type redirection flows. |
 | `results/slack.csv` | Nonzero unmet-demand slack values, if present. |
-| `results/combined_results.xlsx` | Convenience workbook with exported tables. |
+| `results/combined_results.xlsx` | Convenience workbook; oversized tables remain CSV-only. |
 | `results/computational_complexity_table.csv` | Model-size, timing, redirection-complexity, and solver-complexity metrics. |
 | `results/slot_redirection_complexity.csv` | Slot-level redirection set sizes and type-expanded complexity. |
 | `figures/figures_manifest.csv` | List of generated and skipped figures. |
 
-LBBD runs additionally export `results/lbbd_history.csv`, bound summaries, cut diagnostics, candidate-cache diagnostics, and decomposition figures. Benders runs export corresponding iteration and cut-history files. The comparison command writes a formatted Excel workbook under `runs/comparisons/` with economic, infrastructure, energy, redirection, and computational-efficiency comparisons across the three workflows.
-Figures generated automatically from the LBBD run are available in the LBBD [`figures/`](https://github.com/parishwadomkar/Large-scale-LBBD-Optimization/tree/main/runs/2026-08-12_184349_small_with_redirection_LBBD_withPV_withBESS/figures) and, similarly, in other method run output directories.
+LBBD additionally writes `results/lbbd_history.csv`, bound/cut diagnostics, and decomposition figures. Benders writes iteration and cut histories under `iterations/`. A monolithic solve records `results/solver_certificate.json` even when no feasible incumbent is loaded. Comparison workbooks go to `runs/comparisons/`.
 
 
 ---
 
 ## Reproducibility notes
 
-The small dataset is intended for validation, debugging, and comparison across workflows. The full dataset is intended for city-scale analysis and may require a high-memory workstation or HPC node, particularly for the monolithic formulation.
+The small dataset is intended for validation, debugging, and comparison across workflows. The full dataset is intended for city-scale analysis and may require a high memory workstation or HPC node, particularly for the monolithic formulation.
 
-For this maximization model, decomposition gaps are reported using the global upper bound from the relaxed master and the best certified feasible incumbent. Small objective differences across workflows are expected when runs terminate within their requested solver tolerances.
+For this maximization model, the LBBD certificate uses its valid global master upper bound (UB) and best exact-certified feasible lower bound (LB): `(UB - LB) / max(1, abs(UB))`. Monolithic MIP and Benders gaps use the incumbent denominator, `max(1, abs(LB))`. A fixed-layout recourse bound is not a global UB. Inspect termination, slack, bounds, and the achieved gap before using a result.
 
-Large full-data runs should be executed with conservative thread counts, a `SoftMemLimit`, disk-backed node files on a fast local drive, and explicit time limits. The calibrated full LBBD profile uses dual simplex for the large root and node LP relaxations to avoid the higher memory footprint of barrier/concurrent root algorithms. `NodefileStart` controls branch-and-bound tree storage after branching begins; it does not replace the RAM required to build, presolve, and solve the root relaxation.
+Large full-data runs need enough RAM, explicit time and Gurobi soft-memory limits, and a fast local node-file directory. The full LBBD profile requests dual simplex for its large root and node LP relaxations. `NodefileStart` affects branch-and-bound tree storage after branching begins..It cannot reduce memory needed to build or solve the root relaxation.
 
-For LBBD, prefer the dedicated `--master-gap`, `--lbbd-gap`, and `--subproblem-gap` controls when overriding the full-data profile. A single loose `--mip-gap` also loosens the exact annual recourse tolerance. The active configuration for each run is stored with the run outputs.
+For full LBBD runs, use dedicated `--master-gap`, `--lbbd-gap`, and `--subproblem-gap` controls: a loose `--mip-gap` also loosens annual recourse certification. Cold runs must omit external restart/investment options. Record the code commit, input/configuration versions, solver version, and effective settings in each run folder; [`runs/terminal.txt`](runs/terminal.txt) provides the command matrix.
 
 ---
 

@@ -103,9 +103,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compare monolithic, arc-witness Benders, and LBBD result folders."
     )
-    parser.add_argument("--monolithic-run", required=True, help="Monolithic run folder.")
-    parser.add_argument("--benders-run", required=True, help="Arc-witness Benders run folder.")
-    parser.add_argument("--lbbd-run", required=True, help="LBBD run folder.")
+    parser.add_argument("--monolithic-run", default=None, help="Optional monolithic run folder.")
+    parser.add_argument("--benders-run", default=None, help="Optional arc-witness Benders run folder.")
+    parser.add_argument("--lbbd-run", default=None, help="Optional LBBD run folder.")
     parser.add_argument("--out", default=None, help="Optional output XLSX path.")
     parser.add_argument("--project-root", default=str(PROJECT_ROOT))
     parser.add_argument("--dataset", choices=["small", "full"], default=None)
@@ -129,7 +129,10 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional CSV with elapsed time and process-tree RSS samples for the LBBD run.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not any((args.monolithic_run, args.benders_run, args.lbbd_run)):
+        parser.error("Provide at least one of --monolithic-run, --benders-run, or --lbbd-run.")
+    return args
 
 
 def _resolve(root: Path, value: str) -> Path:
@@ -154,7 +157,8 @@ def _number(value: Any) -> Any:
 def _read_summary(run_dir: Path) -> dict[str, Any]:
     path = run_dir / "results" / "model_summary.csv"
     if not path.exists():
-        raise FileNotFoundError(f"Missing model summary: {path}")
+        print(f"No feasible solution summary for {run_dir}; retaining its solver certificate.")
+        return {}
     frame = pd.read_csv(path)
     if not {"Metric", "Value"}.issubset(frame.columns):
         raise ValueError(f"Expected Metric/Value columns in {path}")
@@ -761,7 +765,6 @@ def _relative(value: Any, base: Any) -> float:
 
 def _requested_frame(all_metrics: dict[str, dict[str, Any]]) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
-    mono = all_metrics["Monolithic"]
     for label, key, indent, kind in ROW_SPEC:
         record: dict[str, Any] = {
             "Metric": label,
@@ -771,7 +774,7 @@ def _requested_frame(all_metrics: dict[str, dict[str, Any]]) -> pd.DataFrame:
         }
         if key is not None:
             for method in ("Monolithic", "Benders", "LBBD"):
-                record[method] = all_metrics[method].get(key, math.nan)
+                record[method] = all_metrics.get(method, {}).get(key, math.nan)
             record["Benders - Monolithic"] = _difference(record["Benders"], record["Monolithic"])
             record["LBBD - Monolithic"] = _difference(record["LBBD"], record["Monolithic"])
             record["Benders relative difference"] = _relative(record["Benders"], record["Monolithic"])
@@ -786,7 +789,7 @@ def _raw_frame(all_metrics: dict[str, dict[str, Any]]) -> pd.DataFrame:
     for key in keys:
         row = {"Metric": key}
         for method in ("Monolithic", "Benders", "LBBD"):
-            row[method] = all_metrics[method].get(key, math.nan)
+            row[method] = all_metrics.get(method, {}).get(key, math.nan)
         row["Benders - Monolithic"] = _difference(row["Benders"], row["Monolithic"])
         row["LBBD - Monolithic"] = _difference(row["LBBD"], row["Monolithic"])
         row["Benders relative difference"] = _relative(row["Benders"], row["Monolithic"])
@@ -843,6 +846,62 @@ def _read_history(run_dir: Path, method: str) -> pd.DataFrame:
         if frame is not None:
             return frame
     return pd.DataFrame()
+
+
+def _certification_frame(run_dirs: dict[str, Path], all_metrics: dict[str, dict[str, Any]]) -> pd.DataFrame:
+    """Distinguish an incumbent from a proof of the requested gap."""
+    rows = []
+    for method, directory in run_dirs.items():
+        meta = _read_json_if_present(directory / "run_metadata.json")
+        manifest = _read_json_if_present(directory / "logs" / "benders_manifest.json")
+        cert = _read_json_if_present(directory / "results" / "solver_certificate.json")
+        hist = _read_history(directory, method)
+        last = hist.iloc[-1].to_dict() if not hist.empty else {}
+        first_certified = math.nan
+        if method != "Monolithic" and {"best_lb_SEK", "elapsed_seconds"}.issubset(hist.columns):
+            mask = pd.to_numeric(hist["best_lb_SEK"], errors="coerce").notna()
+            elapsed = pd.to_numeric(hist.loc[mask, "elapsed_seconds"], errors="coerce").dropna()
+            if not elapsed.empty:
+                first_certified = float(elapsed.iloc[0])
+        if method == "Monolithic":
+            incumbent = _finite_float(cert.get("objective_SEK"))
+            if not math.isfinite(incumbent):
+                incumbent = _finite_float(all_metrics[method].get("annual_profit_SEK"))
+            bound = _finite_float(cert.get("valid_bound_SEK"))
+            target = _finite_float(cert.get("requested_mip_gap"))
+            termination = str(cert.get("termination_reason") or "unrecorded")
+            gap = (max(0.0, bound - incumbent) / max(1.0, abs(incumbent))) if math.isfinite(bound) and math.isfinite(incumbent) else math.nan
+            denominator = "max(1, abs(incumbent))"
+            met = termination == "gap_converged" and math.isfinite(gap) and math.isfinite(target) and gap <= target + 1e-9
+        else:
+            incumbent = _finite_float(meta.get("best_lb_SEK"))
+            if not math.isfinite(incumbent):
+                incumbent = _finite_float(last.get("best_lb_SEK"))
+            bound = _finite_float(meta.get("global_ub_SEK"))
+            if not math.isfinite(bound):
+                bound = _finite_float(last.get("global_ub_SEK" if method == "LBBD" else "global_best_UB_SEK"))
+            if method == "LBBD":
+                target = _finite_float(meta.get("effective_settings", {}).get("lbbd_gap"))
+                termination = str(meta.get("termination") or "in_progress_or_unrecorded")
+                denominator = "max(1, abs(global_UB))"
+                gap = (max(0.0, bound - incumbent) / max(1.0, abs(bound))) if math.isfinite(bound) and math.isfinite(incumbent) else math.nan
+            else:
+                target = _finite_float(manifest.get("benders_gap"))
+                termination = str(meta.get("termination") or last.get("status") or "in_progress_or_unrecorded")
+                denominator = "max(1, abs(certified_LB))"
+                gap = (max(0.0, bound - incumbent) / max(1.0, abs(incumbent))) if math.isfinite(bound) and math.isfinite(incumbent) else math.nan
+            met = termination == "certified_gap" and math.isfinite(gap) and math.isfinite(target) and gap <= target + 1e-9
+        rows.append({
+            "Method": method, "Termination": termination,
+            "Feasible incumbent / certified LB (SEK/yr)": incumbent,
+            "Valid global UB (SEK/yr)": bound,
+            "Gap (fraction)": gap, "Gap denominator": denominator,
+            "Requested gap (fraction)": target,
+            "Requested convergence proved": bool(met),
+            "Time to first certified feasible (s)": first_certified,
+            "Run folder": str(directory),
+        })
+    return pd.DataFrame(rows)
 
 
 def _slot_structure_statistics(data: dict) -> dict[str, float]:
@@ -955,7 +1014,7 @@ def _detailed_complexity_tables(
     I, M, H, HSOC, C, B, A = (stats[k] for k in ["I", "M", "H", "HSOC", "C", "B", "A"])
 
     bsc = scalar_map.get("Benders", {})
-    bh = _read_history(run_dirs["Benders"], "Benders")
+    bh = _read_history(run_dirs["Benders"], "Benders") if "Benders" in run_dirs else pd.DataFrame()
     b_cuts = (
         float(pd.to_numeric(bh.get("cuts_added"), errors="coerce").fillna(0).sum())
         if not bh.empty and "cuts_added" in bh.columns else math.nan
@@ -992,7 +1051,7 @@ def _detailed_complexity_tables(
     ]
 
     lsc = scalar_map.get("LBBD", {})
-    lh = _read_history(run_dirs["LBBD"], "LBBD")
+    lh = _read_history(run_dirs["LBBD"], "LBBD") if "LBBD" in run_dirs else pd.DataFrame()
     l_cuts = (
         float(pd.to_numeric(lh.get("new_cuts_total"), errors="coerce").fillna(0).sum())
         if not lh.empty and "new_cuts_total" in lh.columns else math.nan
@@ -1175,7 +1234,7 @@ def _style_workbook(path: Path, requested: pd.DataFrame) -> None:
         "Computational summary", "Build timing", "Redirection complexity",
         "Solver complexity", "Solver log detail", "Preprocessing scalars",
         "Benders complexity", "LBBD complexity", "Efficiency summary",
-        "Memory summary", "Memory trace",
+        "Memory summary", "Memory trace", "Certification",
     ]:
         if sheet_name not in wb.sheetnames:
             continue
@@ -1258,11 +1317,19 @@ def _style_workbook(path: Path, requested: pd.DataFrame) -> None:
 def main() -> int:
     args = parse_args()
     root = Path(args.project_root).resolve()
-    run_dirs = {
-        "Monolithic": _resolve(root, args.monolithic_run),
-        "Benders": _resolve(root, args.benders_run),
-        "LBBD": _resolve(root, args.lbbd_run),
+    supplied = {
+        "Monolithic": args.monolithic_run,
+        "Benders": args.benders_run,
+        "LBBD": args.lbbd_run,
     }
+    run_dirs = {
+        method: _resolve(root, value)
+        for method, value in supplied.items()
+        if value is not None
+    }
+    for method, run_dir in run_dirs.items():
+        if not run_dir.exists():
+            raise FileNotFoundError(f"{method} run folder does not exist: {run_dir}")
     capacity = _load_capacity_config(root)
     all_metrics = {
         method: _enrich(_read_summary(run_dir), run_dir, capacity)
@@ -1287,6 +1354,7 @@ def main() -> int:
             metrics["share_redirected_public_demand"] = redirected / shared_demand if shared_demand > 0 else 0.0
     requested = _requested_frame(all_metrics)
     raw = _raw_frame(all_metrics)
+    certification = _certification_frame(run_dirs, all_metrics)
     computational_summary, build_timing, solver_complexity, solver_log_detail = _complexity_frames(run_dirs)
 
     trace_values = {
@@ -1324,7 +1392,8 @@ def main() -> int:
     else:
         out_dir = root / "runs" / "comparisons"
         out_dir.mkdir(parents=True, exist_ok=True)
-        output = out_dir / f"{datetime.now():%Y-%m-%d_%H%M%S}_monolithic_benders_lbbd_comparison.xlsx"
+        tag = "_".join(method.lower() for method in METHODS if method in run_dirs)
+        output = out_dir / f"{datetime.now():%Y-%m-%d_%H%M%S}_{tag}_comparison.xlsx"
     output.parent.mkdir(parents=True, exist_ok=True)
 
     visible_requested = requested.drop(columns=["MetricKey", "Indent", "Format"])
@@ -1335,6 +1404,7 @@ def main() -> int:
         # Leave rows 1-5 for title and run paths.
         visible_requested.to_excel(writer, sheet_name="Comparison", index=False, startrow=5)
         raw.to_excel(writer, sheet_name="Raw metrics", index=False)
+        certification.to_excel(writer, sheet_name="Certification", index=False, na_rep="NA")
         run_folders.to_excel(writer, sheet_name="Run folders", index=False)
         computational_summary.to_excel(writer, sheet_name="Computational summary", index=False)
         build_timing.to_excel(writer, sheet_name="Build timing", index=False)
@@ -1350,9 +1420,9 @@ def main() -> int:
             memory_trace.to_excel(writer, sheet_name="Memory trace", index=False)
     wb = load_workbook(output)
     ws = wb["Comparison"]
-    ws["B2"] = str(run_dirs["Monolithic"])
-    ws["B3"] = str(run_dirs["Benders"])
-    ws["B4"] = str(run_dirs["LBBD"])
+    ws["B2"] = str(run_dirs["Monolithic"]) if "Monolithic" in run_dirs else "NA"
+    ws["B3"] = str(run_dirs["Benders"]) if "Benders" in run_dirs else "NA"
+    ws["B4"] = str(run_dirs["LBBD"]) if "LBBD" in run_dirs else "NA"
     wb.save(output)
     _style_workbook(output, requested)
 

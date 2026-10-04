@@ -1,0 +1,28 @@
+phase,iteration,cut_family,accepted_cuts,cumulative_cuts
+initial_master,0,Static origin,0,0
+root_screen,0,Hall/min-cut,0,0
+bootstrap_repair,0,Hall/min-cut,156,156
+outer_iteration,1,Hall/min-cut,0,156
+outer_iteration,1,Component LP,0,156
+outer_iteration,1,Annual LP,0,156
+outer_iteration,1,Core-point LP,0,156
+outer_iteration,1,Exact configuration,1,157
+outer_iteration,1,Partial logic,0,157
+outer_iteration,2,Hall/min-cut,0,157
+outer_iteration,2,Component LP,0,157
+outer_iteration,2,Annual LP,0,157
+outer_iteration,2,Core-point LP,0,157
+outer_iteration,2,Exact configuration,1,158
+outer_iteration,2,Partial logic,0,158
+outer_iteration,3,Hall/min-cut,0,158
+outer_iteration,3,Component LP,0,158
+outer_iteration,3,Annual LP,0,158
+outer_iteration,3,Core-point LP,0,158
+outer_iteration,3,Exact configuration,1,159
+outer_iteration,3,Partial logic,0,159
+outer_iteration,4,Hall/min-cut,0,159
+outer_iteration,4,Component LP,0,159
+outer_iteration,4,Annual LP,0,159
+outer_iteration,4,Core-point LP,0,159
+outer_iteration,4,Exact configuration,0,159
+outer_iteration,4,Partial logic,0,159

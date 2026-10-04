@@ -1,0 +1,102 @@
+PowerShell commands for reproducible optimization runs
+======================================================
+Run from the repository root with the revised code, config files, Gurobi license, and full Git LFS inputs. Execute selected runs separately; the full models can take days. Record `git rev-parse HEAD`, Gurobi/Python versions, and the run folder.
+These are cold commands: no prior run, external investment, or checkpoint is used.
+Targets are requested tolerances, not claims that every run will achieve them.
+
+git lfs pull
+$NodeFileDir = Join-Path (Get-Location) 'runs\gurobi_nodefiles'
+New-Item -ItemType Directory -Force -Path $NodeFileDir | Out-Null
+git rev-parse HEAD
+
+
+Small three-method validation (same input, technology, redirection, threads, target)
+-------------------------------------------------------------------------------
+python .\src\run_optimization.py --dataset small --scenario with_redirection --threads 10 --mip-gap 0.0001
+python .\src_benders\run_benders.py --dataset small --scenario with_redirection --threads 10 --master-gap 0.0001 --benders-gap 0.0001
+python .\src_lbbd\run_lbbd.py --dataset small --scenario with_redirection --threads 10 --master-gap 0.0001 --subproblem-gap 0.00001 --lbbd-gap 0.0001
+
+
+Full LBBD scenario matrix
+-------------------------
+Common options reproduce the documented cold full LBBD configuration, including the 0.020% outer-gap target and 10-thread/180-GB solver budget of the supplied September 2026 full run. 
+The observed run used the full PV+BESS/redirection scenario (06). The other scenario outcomes must be certified independently.
+The full profile in config/run_profiles.json supplies the remaining controls.
+
+$LbbdFull = @(
+  '--dataset','full','--threads','10','--subproblem-threads','2',
+  '--first-master-lp-bootstrap','--bootstrap-hall-repair-passes','3',
+  '--exact-slack-repair-passes','2','--integer-only-master-start',
+  '--bootstrap-hall-refinement-rounds','0','--lp-fallback-on-master-no-incumbent',
+  '--bound-polish','--bound-polish-trigger-gap','0.001',
+  '--master-gap','0.0001','--master-gap-tight','0.00002',
+  '--lbbd-gap','0.0002','--subproblem-gap','0.00001',
+  '--annual-lp-frequency','1','--annual-core-cut-frequency','1',
+  '--max-iterations','16','--time-limit','1728000',
+  '--master-time-limit','172800','--master-late-time-limit','172800',
+  '--subproblem-time-limit','172800','--annual-lp-time-limit','86400',
+  '--soft-mem-limit-gb','180','--nodefile-start','0.5',
+  '--nodefile-dir',$NodeFileDir
+)
+
+# 01 Chargers only; no redirection
+python .\src_lbbd\run_lbbd.py @LbbdFull --scenario no_redirection --disable-pv --disable-bess
+# 02 Chargers only; redirection
+python .\src_lbbd\run_lbbd.py @LbbdFull --scenario with_redirection --disable-pv --disable-bess
+# 03 Chargers + PV; no redirection
+python .\src_lbbd\run_lbbd.py @LbbdFull --scenario no_redirection --disable-bess
+# 04 Chargers + PV; redirection
+python .\src_lbbd\run_lbbd.py @LbbdFull --scenario with_redirection --disable-bess
+# 05 Chargers + PV + BESS; no redirection
+python .\src_lbbd\run_lbbd.py @LbbdFull --scenario no_redirection
+# 06 Chargers + PV + BESS; redirection (main cold full scenario)
+python .\src_lbbd\run_lbbd.py @LbbdFull --scenario with_redirection
+# 07 Chargers + BESS; no redirection
+python .\src_lbbd\run_lbbd.py @LbbdFull --scenario no_redirection --disable-pv
+# 08 Chargers + BESS; redirection
+python .\src_lbbd\run_lbbd.py @LbbdFull --scenario with_redirection --disable-pv
+
+
+Prospective matched-budget full three-method comparison
+-------------------------------------------------------
+Run 06 above, then the two commands below on the same code/data/config and machine. 
+They request the same 10-thread, 180-GB Gurobi soft-memory, 0.5-GB node-file and 0.020% final-gap settings. The monolithic --time-limit applies to its solver call.
+Benders also has an overall limit. Report actual end-to-end time, process-tree peak RSS, achieved gaps, and termination for each method.
+These commands do not recreate older public monolithic or Benders runs.
+
+python .\src\run_optimization.py --dataset full --scenario with_redirection --threads 10 --mip-gap 0.0002 --time-limit 1728000 --soft-mem-limit-gb 180 --nodefile-start 0.5 --nodefile-dir $NodeFileDir
+python .\src_benders\run_benders.py --dataset full --scenario with_redirection --threads 10 --master-gap 0.0001 --benders-gap 0.0002 --cut-strategy standard --max-iterations 60 --time-limit 1728000 --overall-time-limit 1728000 --soft-mem-limit-gb 180 --nodefile-start 0.5 --nodefile-dir $NodeFileDir
+
+python .\src\compare_runs.py --dataset full --scenario with_redirection --monolithic-run 'runs\<MONOLITHIC_RUN_FOLDER>' --benders-run 'runs\<BENDERS_RUN_FOLDER>' --lbbd-run 'runs\<LBBD_RUN_FOLDER>'
+
+
+Full monolithic sensitivity commands
+------------------------------------
+These reproduce the parameter choices in the original command list, using a
+consistent 10-thread, 180-GB, 0.1% requested solver gap. The historical runs
+used different settings, so compare their measured bounds and terminations
+before using any outcome as a manuscript sensitivity result. Change only the
+named parameter between baseline and each variant; defaults are 30 km/h,
+80 SEK/h, and 1.5 km in config/model_config.json.
+
+$SensitivityFull = @(
+  '--dataset','full','--scenario','with_redirection','--threads','10',
+  '--mip-gap','0.001','--time-limit','1728000',
+  '--soft-mem-limit-gb','180','--nodefile-start','0.5',
+  '--nodefile-dir',$NodeFileDir
+)
+
+python .\src\run_optimization.py @SensitivityFull --speed-car-kmh 30 --value-time-sek-per-h 80 --max-redirection-distance-km 1.5 --sensitivity-name baseline_speed30_vot80_dist1p5
+python .\src\run_optimization.py @SensitivityFull --speed-car-kmh 10 --value-time-sek-per-h 80 --max-redirection-distance-km 1.5 --sensitivity-name sens_speed10
+python .\src\run_optimization.py @SensitivityFull --speed-car-kmh 20 --value-time-sek-per-h 80 --max-redirection-distance-km 1.5 --sensitivity-name sens_speed20
+python .\src\run_optimization.py @SensitivityFull --speed-car-kmh 40 --value-time-sek-per-h 80 --max-redirection-distance-km 1.5 --sensitivity-name sens_speed40
+python .\src\run_optimization.py @SensitivityFull --speed-car-kmh 30 --value-time-sek-per-h 50 --max-redirection-distance-km 1.5 --sensitivity-name sens_vot50
+python .\src\run_optimization.py @SensitivityFull --speed-car-kmh 30 --value-time-sek-per-h 100 --max-redirection-distance-km 1.5 --sensitivity-name sens_vot100
+python .\src\run_optimization.py @SensitivityFull --speed-car-kmh 30 --value-time-sek-per-h 80 --max-redirection-distance-km 1.2 --sensitivity-name sens_dist1p2
+python .\src\run_optimization.py @SensitivityFull --speed-car-kmh 30 --value-time-sek-per-h 80 --max-redirection-distance-km 2.0 --sensitivity-name sens_dist2p0
+
+Check each output's objective, valid bound, achieved gap, slack, resource consumption, input/configuration version, and termination.
+A memory/time-limited incumbent is usable, but it does not meet the requested certificate by itself.
+The same-method comparison is separate from the three-method comparison:
+
+python .\src\compare_scenarios.py --method lbbd --run 'runs\<SCENARIO_1>' --run 'runs\<SCENARIO_2>' --baseline-index 1

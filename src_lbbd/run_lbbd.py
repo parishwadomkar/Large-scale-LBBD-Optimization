@@ -29,6 +29,7 @@ from run_profiles import apply_profile_defaults, load_run_profile
 from technology_switches import apply_technology_switches
 from visualize_results import generate_run_figures
 from computational_complexity import ResourceMonitor, model_statistics, write_run_complexity
+from solve_model import _gurobi_log_has_soft_memory_stop
 from decomposition_types import ComponentLogicOptimalityCut, build_slot_components
 from network_feasibility import FeasibilityNetworkOracle
 from operational_recourse import (
@@ -410,6 +411,7 @@ class _ExpectedAbortedLoadFilter(logging.Filter):
 
 
 def _solve_and_load(opt, model, *, tee: bool, warmstart: bool = False):
+    model._last_solve_loaded_incumbent = False
     kwargs = {"tee": bool(tee), "load_solutions": False}
     if warmstart:
         kwargs["warmstart"] = True
@@ -422,6 +424,11 @@ def _solve_and_load(opt, model, *, tee: bool, warmstart: bool = False):
     has_solution = len(getattr(results, "solution", [])) > 0
     term = getattr(results.solver, "termination_condition", None)
     status = getattr(results.solver, "status", None)
+    if status == SolverStatus.error and _gurobi_log_has_soft_memory_stop(Path(str(opt.options.get("LogFile", "")))):
+        results.solver.status = SolverStatus.aborted
+        results.solver.termination_condition = TerminationCondition.resourceInterrupt
+        status = results.solver.status
+        term = results.solver.termination_condition
     # Gurobi can return an incumbent under time, memory, or SolutionLimit
     # termination.  If a solution is present, load it unless the solver explicitly
     # reports an infeasible/unbounded/error state.  This is important for the
@@ -444,6 +451,7 @@ def _solve_and_load(opt, model, *, tee: bool, warmstart: bool = False):
         logger.addFilter(filter_)
         try:
             model.solutions.load_from(results)
+            model._last_solve_loaded_incumbent = True
         finally:
             logger.removeFilter(filter_)
     return results
@@ -462,6 +470,7 @@ def _solve_lp_and_load(opt, model, *, tee: bool):
     results object actually contains a solution.  Callers still decide whether the
     termination condition is strong enough for their purpose.
     """
+    model._last_solve_loaded_incumbent = False
     results = opt.solve(model, tee=bool(tee), load_solutions=False)
     try:
         has_solution = len(getattr(results, "solution", [])) > 0
@@ -470,6 +479,7 @@ def _solve_lp_and_load(opt, model, *, tee: bool):
     if has_solution:
         try:
             model.solutions.load_from(results)
+            model._last_solve_loaded_incumbent = True
         except ValueError as exc:
             print(
                 "WARNING: Solver returned a result that Pyomo could not load "
@@ -622,7 +632,7 @@ def _loaded_master_eta(model) -> float:
 
 
 def _is_usable_mip(results, model) -> bool:
-    if not _has_loaded_objective(model):
+    if not getattr(model, "_last_solve_loaded_incumbent", False) or not _has_loaded_objective(model):
         return False
     term = _solver_term(results)
     bad = ("infeasible" in term) or ("unbounded" in term and "infeasibleorunbounded" not in term)
@@ -722,9 +732,10 @@ def _solve_fixed_exact(data: dict, cfg: dict, args, run_dir: Path, inv: Investme
     except Exception:
         upper = math.nan
     if not math.isfinite(upper):
-        upper = objective
+        # The incumbent is a fixed-layout upper bound only after optimality.
+        upper = objective if getattr(results.solver, "termination_condition", None) == TerminationCondition.optimal else math.inf
     upper = max(objective, upper)
-    gap = max(0.0, upper - objective) / max(1.0, abs(upper))
+    gap = _rel_gap(upper, objective)
     return model, results, objective, upper, gap
 
 
@@ -1138,7 +1149,7 @@ def _solve_master_lp_bootstrap(
         elapsed = time.time() - started
         term = _solver_term(results)
         eta_value = _loaded_master_eta(master)
-        if not _is_optimal_lp(results) or not math.isfinite(eta_value):
+        if not _is_optimal_lp(results) or not getattr(master, "_last_solve_loaded_incumbent", False) or not math.isfinite(eta_value):
             print(
                 "LP bootstrap solution-load check failed: "
                 f"termination={term}, eta_loaded={math.isfinite(eta_value)}, "
@@ -1179,7 +1190,7 @@ def _complete_master_start(
         results = _solve_lp_and_load(opt, master, tee=bool(args.tee))
         elapsed = time.time() - started
         eta_value = _loaded_master_eta(master)
-        if not _is_optimal_lp(results) or not math.isfinite(eta_value):
+        if not _is_optimal_lp(results) or not getattr(master, "_last_solve_loaded_incumbent", False) or not math.isfinite(eta_value):
             print(
                 "Fixed-investment master LP completion failed: "
                 f"termination={_solver_term(results)}, "
@@ -2119,24 +2130,29 @@ def main() -> int:
             )
             if resume_run_path is not None:
                 print(f"Loading certified development resume run: {resume_run_path}")
-                bootstrap_candidate, bootstrap_upper_bound, previous_certified_lb = _load_certified_run(
+                bootstrap_candidate, previous_upper_bound, previous_certified_lb = _load_certified_run(
                     resume_run_path, args
                 )
                 bootstrap_master_eta = math.nan
-                bootstrap_lp_seconds = 0.0
+                _, bootstrap_upper_bound, bootstrap_lp_seconds = _solve_master_lp_bootstrap(
+                    master, args, run_dir, log_name="lbbd_master_resume_bound_lp.log"
+                )
                 print(
-                    f"Reused previously proved global UB {bootstrap_upper_bound:,.3f} SEK/year; "
-                    f"previous certified LB {previous_certified_lb:,.3f} SEK/year will be re-certified."
+                    f"Previous UB {previous_upper_bound:,.3f} and LB {previous_certified_lb:,.3f} "
+                    "are informational; the current master LP reproves the UB and the annual MIP re-certifies the investment."
                 )
             elif checkpoint_path is not None:
                 print(f"Loading development bootstrap checkpoint: {checkpoint_path}")
-                bootstrap_candidate, bootstrap_upper_bound, bootstrap_master_eta = _load_bootstrap_checkpoint(
+                bootstrap_candidate, previous_upper_bound, _ = _load_bootstrap_checkpoint(
                     checkpoint_path, args
                 )
-                bootstrap_lp_seconds = 0.0
+                _, bootstrap_upper_bound, bootstrap_lp_seconds = _solve_master_lp_bootstrap(
+                    master, args, run_dir, log_name="lbbd_master_checkpoint_bound_lp.log"
+                )
+                bootstrap_master_eta = math.nan
                 print(
-                    f"Reused previously proved checkpoint UB {bootstrap_upper_bound:,.3f} SEK/year; "
-                    "the candidate will be re-screened and re-completed under the current master cuts."
+                    f"Previous checkpoint UB {previous_upper_bound:,.3f} is informational; "
+                    "the current master LP reproves the UB before the candidate is used."
                 )
             else:
                 print("Solving continuous initial-master relaxation for the full-data bootstrap...")
@@ -2386,7 +2402,7 @@ def main() -> int:
                     global_upper_bound=best_global_ub,
                 )
                 eta_value = pyo.value(master.Eta, exception=False)
-                has_result_solution = len(getattr(master_results, "solution", [])) > 0
+                has_result_solution = bool(getattr(master, "_last_solve_loaded_incumbent", False))
                 if (not has_result_solution) or eta_value is None or not math.isfinite(float(eta_value)):
                     bound_without_incumbent = _master_bound(master_results, master)
                     if math.isfinite(bound_without_incumbent):
@@ -2494,8 +2510,13 @@ def main() -> int:
                     master_eta = float(pyo.value(master.Eta))
                     current_bound = _master_bound(master_results, master)
                     master_term = _solver_term(master_results)
-                    master_internal_gap = _rel_gap(current_bound, master_eta)
-                    master_candidate_bound_gap = master_internal_gap
+                    # Gurobi MIPGap uses the incumbent denominator; the outer
+                    # LBBD gap intentionally uses the global UB denominator.
+                    master_internal_gap = (
+                        max(0.0, current_bound - master_eta) / max(1.0, abs(master_eta))
+                        if math.isfinite(current_bound) else math.nan
+                    )
+                    master_candidate_bound_gap = _rel_gap(current_bound, master_eta)
                     candidate_source = "master_mip_incumbent"
 
                 # Candidate is supplied by the bootstrap, a genuine master-MIP
@@ -2615,9 +2636,16 @@ def main() -> int:
                                 if annual_core_violation > core_threshold:
                                     annual_core_cut_added = int(add_annual_lp_cut(master, core_cut))
 
-                    exact_model, exact_results, exact_obj, exact_ub, exact_gap = _solve_fixed_exact(
-                        data, cfg, args, run_dir, candidate, iteration
-                    )
+                    try:
+                        exact_model, exact_results, exact_obj, exact_ub, exact_gap = _solve_fixed_exact(
+                            data, cfg, args, run_dir, candidate, iteration
+                        )
+                    except RuntimeError as exc:
+                        termination = "exact_oracle_no_incumbent"
+                        print(f"Exact annual certification stopped without an incumbent: {exc}")
+                        if best_model is None:
+                            raise
+                        break
                     if (
                         development_investment_source is not None
                         and development_investment_signature is not None
@@ -2672,19 +2700,25 @@ def main() -> int:
                             )
                             for action in repair_actions[:30]:
                                 print(f"  {action}")
-                            repaired_model, repaired_results, repaired_obj, repaired_ub, repaired_gap = _solve_fixed_exact(
-                                data, cfg, args, run_dir, repaired_candidate, iteration * 100 + 1
-                            )
-                            exact_cache[repaired_signature] = {
-                                "objective": float(repaired_obj),
-                                "upper_bound": float(repaired_ub),
-                                "gap": float(repaired_gap),
-                            }
+                            try:
+                                repaired_model, repaired_results, repaired_obj, repaired_ub, repaired_gap = _solve_fixed_exact(
+                                    data, cfg, args, run_dir, repaired_candidate, iteration * 100 + 1
+                                )
+                            except RuntimeError as exc:
+                                print(f"Exact-slack repair could not be certified; retaining original candidate: {exc}")
+                                repaired_model, repaired_obj, repaired_ub, repaired_gap = None, -math.inf, math.inf, math.inf
+                            if repaired_model is not None:
+                                exact_cache[repaired_signature] = {
+                                    "objective": float(repaired_obj),
+                                    "upper_bound": float(repaired_ub),
+                                    "gap": float(repaired_gap),
+                                }
                             # Preserve a valid configuration cut for the original exact
                             # point before moving the reported candidate to the repaired one.
-                            exact_config_added += int(add_exact_config_cut(
-                                master, ExactConfigCut(iteration * 100, candidate, exact_ub, exact_obj, exact_gap)
-                            ))
+                            if math.isfinite(exact_ub):
+                                exact_config_added += int(add_exact_config_cut(
+                                    master, ExactConfigCut(iteration * 100, candidate, exact_ub, exact_obj, exact_gap)
+                                ))
                             if repaired_obj > best_lb:
                                 best_lb = repaired_obj
                                 best_model = repaired_model
@@ -2713,6 +2747,7 @@ def main() -> int:
 
                 if (
                     master_term != "mip_bound_only_certified"
+                    and math.isfinite(exact_ub)
                     and (
                         not math.isfinite(float(master_eta))
                         or float(master_eta) > float(exact_ub) + float(args.lp_cut_abs_tol)

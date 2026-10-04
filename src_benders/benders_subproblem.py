@@ -197,11 +197,13 @@ def solve_type_assignment_lp(
         sp_dir = Path(run_dir) / "subproblems"
         sp_dir.mkdir(parents=True, exist_ok=True)
         opt.options["LogFile"] = str((sp_dir / f"type_lp_it{iteration:03d}_{mon}_{int(t):02d}.log").resolve()).replace("\\", "/")
-    res = opt.solve(m, tee=False)
+    res = opt.solve(m, tee=False, load_solutions=False)
     term = str(res.solver.termination_condition).lower()
     status = str(res.solver.status).lower()
-    if not ("optimal" in term or "feasible" in term):
+    # Dual multipliers yield a globally valid cut only after LP optimality.
+    if "optimal" not in term or not getattr(res, "solution", None) or status == "error":
         return TypeAssignmentResult(mon, int(t), float("inf"), float(interface["theta"].get((mon, int(t)), 0.0)), float("inf"), [], {}, {}, {}, "none", float("inf"), len(slot_arcs), len(m.ZIDX), status, term)
+    m.solutions.load_from(res)
 
     flows = []
     for (i, j, co, cd) in m.ZIDX:
@@ -250,14 +252,14 @@ def add_type_assignment_cut(model, res: TypeAssignmentResult, tol: float = 1e-9)
     mon, t = res.mon, int(res.t)
     expr = 0
     nz = 0
+    # Even a tiny *negative* dual cannot be dropped: doing so raises this
+    # minimum-recourse lower cut at other interfaces and can remove an exact
+    # feasible solution. Retain the complete certified dual vector.
     for (i, c), v in res.dual_R.items():
-        if abs(v) > tol:
-            expr += v * model.R[int(i), mon, t, str(c)]; nz += 1
+        expr += v * model.R[int(i), mon, t, str(c)]; nz += int(v != 0.0)
     for (j, c), v in res.dual_W.items():
-        if abs(v) > tol:
-            expr += v * model.W[int(j), mon, t, str(c)]; nz += 1
+        expr += v * model.W[int(j), mon, t, str(c)]; nz += int(v != 0.0)
     for (i, j), v in res.dual_G.items():
-        if abs(v) > tol:
-            expr += v * model.G[int(i), int(j), mon, t]; nz += 1
+        expr += v * model.G[int(i), int(j), mon, t]; nz += int(v != 0.0)
     model.TypeAssignmentCuts.add(model.ThetaType[mon, t] >= expr)
     return nz

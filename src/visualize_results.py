@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import math
+import os
+import re
 import traceback
 from pathlib import Path
 from typing import Callable
+from urllib.parse import quote
 
 import matplotlib
 matplotlib.use("Agg")
@@ -136,24 +140,48 @@ def _sem(series: pd.Series) -> float:
     return float(values.std(ddof=1) / math.sqrt(len(values)))
 
 
-def _add_basemap(ax: plt.Axes, alpha: float = 0.30) -> bool:
-    """Add a faint CartoDB basemap when contextily and internet access are available."""
+def _add_basemap(ax: plt.Axes, alpha: float = 0.30, source: str = "auto") -> bool:
+    """Draw licensed tiles only when the selected provider's access rules are met."""
+    if source == "none":
+        return False
     try:
         import contextily as ctx
+        key = os.environ.get("CARTO_BASEMAP_API_KEY", "").strip()
+        provider = "carto" if source == "auto" and key else "osm" if source == "auto" else source
+        params = {}
+        if provider == "carto":
+            if not key:
+                print("WARNING: CARTO basemap requires CARTO_BASEMAP_API_KEY; using vector layers only")
+                return False
+            params["source"] = (
+                "https://basemaps.cartocdn.com/light_nolabels/"
+                "{z}/{x}/{y}.png?key=" + quote(key, safe="")
+            )
+            params["attribution"] = "(C) OpenStreetMap contributors, (C) CARTO"
+        elif provider == "osm":
+            if "headers" not in inspect.signature(ctx.add_basemap).parameters:
+                print("WARNING: OpenStreetMap basemap needs contextily with request-header support; using vector layers only")
+                return False
+            params["source"] = ctx.providers.OpenStreetMap.Mapnik
+            params["headers"] = {
+                "User-Agent": "Large-scale-LBBD-Optimization/1.0 (https://github.com/parishwadomkar/Large-scale-LBBD-Optimization)"
+            }
+        else:
+            raise ValueError(f"Unsupported basemap provider: {provider}")
         xlim, ylim = ax.get_xlim(), ax.get_ylim()
         ctx.add_basemap(
             ax,
-            source=ctx.providers.CartoDB.PositronNoLabels,
             crs="EPSG:3857",
             alpha=float(alpha),
             reset_extent=False,
             attribution_size=6,
+            **params,
         )
         ax.set_xlim(xlim)
         ax.set_ylim(ylim)
         return True
     except Exception as exc:
-        print(f"WARNING: Basemap unavailable; map generated with vector layers only ({exc})")
+        print(f"WARNING: Basemap unavailable ({type(exc).__name__}); using vector layers only")
         return False
 
 
@@ -723,6 +751,90 @@ def _sum_columns(df: pd.DataFrame, columns: list[str]) -> pd.Series:
         return pd.Series(0.0, index=df.index)
     return sum((_numeric(df[col]).fillna(0.0) for col in present), start=pd.Series(0.0, index=df.index))
 
+
+def _lbbd_metadata(run_dir: Path) -> dict:
+    path = run_dir / "run_metadata.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+def _lbbd_cut_accounting(run_dir: Path, df: pd.DataFrame, figures_dir: Path) -> tuple[pd.DataFrame, int | None]:
+    metadata = _lbbd_metadata(run_dir)
+    timing = metadata.get("computational_complexity", {}).get("phase_timing", {})
+    recorded = "bootstrap_hall_cuts_added" in timing
+    pre_loop = [
+        ("initial_master", "Static origin", int(metadata.get("static_origin_profit_cuts", 0))),
+        ("root_screen", "Hall/min-cut", int(metadata.get("root_hall_profit_cuts", 0))),
+        ("bootstrap_repair", "Hall/min-cut", int(timing.get("bootstrap_hall_cuts_added", 0))),
+    ] if recorded else []
+    rows = []
+    cumulative = 0
+    for phase, family, count in pre_loop:
+        cumulative += count
+        rows.append((phase, 0, family, count, cumulative))
+    for _, record in df.iterrows():
+        iteration = int(record["iteration"])
+        accepted = 0
+        for column, family in _lbbd_cut_columns(df):
+            raw = pd.to_numeric(record.get(column, 0), errors="coerce")
+            count = int(round(float(raw))) if pd.notna(raw) else 0
+            cumulative += count
+            accepted += count
+            rows.append(("outer_iteration", iteration, family, count, cumulative))
+        if "new_cuts_total" in df.columns and accepted != int(record["new_cuts_total"]):
+            raise ValueError(f"LBBD cut-family sum disagrees with new_cuts_total at iteration {iteration}")
+    audit = pd.DataFrame(rows, columns=["phase", "iteration", "cut_family", "accepted_cuts", "cumulative_cuts"])
+    audit.to_csv(figures_dir / "lbbd_cut_accounting.csv", index=False)
+    baseline = sum(count for _, _, count in pre_loop) if recorded else None
+    initial = metadata.get("initial_master_constraints")
+    final = metadata.get("final_master_constraints")
+    if baseline is not None and initial is not None and final is not None:
+        # Static origin cuts are already present in the recorded initial master.
+        extra_constraints = int(final) - int(initial)
+        expected = cumulative - int(metadata.get("static_origin_profit_cuts", 0))
+        if extra_constraints < expected:
+            raise ValueError("Accepted cuts exceed the recorded increase in master constraints")
+    return audit, baseline
+
+
+def _lbbd_source_labels(df: pd.DataFrame) -> list[str]:
+    names = {
+        "lp_bootstrap": "LP bootstrap",
+        "master_mip_incumbent": "master MIP",
+        "lp_fallback": "LP fallback",
+        "best_certified_incumbent_bound_only": "bound only",
+    }
+    return [
+        f"{int(row['iteration'])}\n{names.get(str(row.get('candidate_source', '')), str(row.get('candidate_source', '')))}"
+        for _, row in df.iterrows()
+    ]
+
+
+def _lbbd_exact_evaluation_audit(run_dir: Path, figures_dir: Path) -> pd.DataFrame:
+    logs = _read_csv(run_dir / "results" / "solver_log_complexity.csv")
+    if logs.empty or "log_name" not in logs.columns:
+        return pd.DataFrame()
+    rows = []
+    for _, record in logs.iterrows():
+        match = re.fullmatch(r"lbbd_exact_annual_(\d+)\.log", str(record["log_name"]))
+        if not match:
+            continue
+        call_id = int(match.group(1))
+        rows.append({
+            "iteration": call_id if call_id < 100 else call_id // 100,
+            "exact_call_id": call_id,
+            "stage": "repair" if call_id >= 100 else "trial",
+            "objective_SEK": record.get("final_objective"),
+            "fixed_upper_bound_SEK": record.get("final_bound"),
+            "solver_seconds": record.get("solver_seconds"),
+            "work_units": record.get("work_units"),
+            "log_name": record["log_name"],
+        })
+    audit = pd.DataFrame(rows)
+    if not audit.empty:
+        audit = audit.sort_values(["iteration", "exact_call_id"])
+        audit.to_csv(figures_dir / "lbbd_exact_evaluations.csv", index=False)
+    return audit
+
 def _plot_decomposition_convergence(run_dir: Path, figures_dir: Path, dpi: int) -> list[str]:
     path = _find_history(run_dir)
     if path is None:
@@ -742,6 +854,8 @@ def _plot_decomposition_convergence(run_dir: Path, figures_dir: Path, dpi: int) 
     fig, ax = plt.subplots(figsize=(9.8, 6.2))
     upper_line, = ax.plot(iteration, ub, marker="o", linewidth=1.8, label="Global master upper bound")
     lower_line, = ax.plot(iteration, lb, marker="o", linewidth=1.8, label="Best certified lower bound")
+    ax.set_xticks(iteration)
+    ax.set_xticklabels([str(int(v)) for v in iteration])
     ax.set_xlabel(f"{method} iteration")
     ax.set_ylabel("Objective bound (million SEK/year)")
     ax.set_title(f"{method} convergence")
@@ -755,12 +869,15 @@ def _plot_decomposition_convergence(run_dir: Path, figures_dir: Path, dpi: int) 
             ax2.set_ylim(0, max(0.01, 1.22 * float(finite_gap.max())))
         ax2.set_ylabel(f"Certified {method} gap (%)")
         ax2.grid(False)
-        for k, (x_value, gap) in enumerate(zip(iteration, gap_values)):
-            if not np.isfinite(gap):
-                continue
+        valid = [(float(x), float(g)) for x, g in zip(iteration, gap_values) if np.isfinite(g)]
+        for k, (x_value, gap) in enumerate((valid[0], valid[-1]) if len(valid) > 1 else valid):
             label = f"{gap:.4f}%" if gap < 0.1 else f"{gap:.3f}%"
-            offset = 8 if k % 2 == 0 else -13
-            ax2.annotate(label, (x_value, gap), xytext=(0, offset), textcoords="offset points", ha="center", va="bottom" if offset > 0 else "top", fontsize=8, color=gap_line.get_color())
+            ax2.annotate(label, (x_value, gap), xytext=(7 if k == 0 else -8, 9 if k == 0 else 15), textcoords="offset points", ha="left" if k == 0 else "right", va="bottom", fontsize=8, color=gap_line.get_color())
+        if method == "LBBD":
+            target = _lbbd_metadata(run_dir).get("effective_settings", {}).get("lbbd_gap")
+            if target is not None:
+                ax2.axhline(100.0 * float(target), color="0.50", linestyle=":", linewidth=1.2)
+                ax2.text(0.98, 0.16, f"Dotted target: {100.0 * float(target):.4f}%", transform=ax2.transAxes, ha="right", va="bottom", fontsize=9, color="0.35")
         handles.append(gap_line)
         labels.append(f"Certified {method} gap")
     _boxed_legend_below(fig, handles, labels, ncol=3, bottom=0.23)
@@ -826,102 +943,64 @@ def _plot_decomposition_cut_generation(run_dir: Path, figures_dir: Path, dpi: in
         )
         return _save(fig, figures_dir, "17_decomposition_cut_generation", dpi)
 
-    families = [
-        (column, label)
-        for column, label in _lbbd_cut_columns(df)
-        if column in df.columns
-    ]
-    if not families:
-        raise ValueError("LBBD history lacks cut-family columns")
-
-    values = {
-        label: _numeric(df[column]).fillna(0.0)
-        for column, label in families
-    }
-    active = [
-        (label, series)
-        for label, series in values.items()
-        if float(series.sum()) > 0
-    ]
-
-    if not active:
+    audit, baseline = _lbbd_cut_accounting(run_dir, df, figures_dir)
+    per_family = [(col, label) for col, label in _lbbd_cut_columns(df) if col in df.columns]
+    active = [(col, label) for col, label in per_family if _numeric(df[col]).fillna(0).sum() > 0]
+    pre_loop = audit[audit["phase"] != "outer_iteration"]
+    pre_count = int(pre_loop["accepted_cuts"].sum())
+    if not active and pre_count == 0:
         raise ValueError("No LBBD cuts were accepted")
-
-    total = sum(
-        (series for _, series in active),
-        start=pd.Series(0.0, index=df.index),
+    outer_total = _sum_columns(df, [col for col, _ in per_family]).to_numpy(dtype=float)
+    cumulative = outer_total.cumsum() + (baseline or 0)
+    fig, (setup_ax, ax) = plt.subplots(
+        1, 2, figsize=(11.7, 5.6), gridspec_kw={"width_ratios": [1, 2.6]}
     )
-    cumulative = total.cumsum()
+    setup_parts = [
+        ("Static origin", "#8c8c8c", int(pre_loop.loc[pre_loop["cut_family"] == "Static origin", "accepted_cuts"].sum())),
+        ("Hall/min-cut (pre-loop)", "#4c78a8", int(pre_loop.loc[pre_loop["cut_family"] == "Hall/min-cut", "accepted_cuts"].sum())),
+    ]
+    base_height = 0
+    for label, color, count in setup_parts:
+        if count:
+            setup_ax.bar(0, count, bottom=base_height, width=0.62, color=color, label=label)
+            base_height += count
+    setup_ax.text(0, pre_count + max(0.2, 0.02 * pre_count), str(pre_count) if baseline is not None else "unreported", ha="center", fontsize=9)
+    setup_ax.set_ylim(0, max(1.35, pre_count * 1.16))
+    setup_ax.set_xlim(-0.7, 0.7)
+    setup_ax.set_xticks([0], ["Pre-loop"])
+    setup_ax.set_ylabel("Accepted before iteration 1")
+    setup_ax.set_title("Initial strengthening")
 
-    fig, ax = plt.subplots(figsize=(10.5, 6.1))
-    bottom = np.zeros(len(df), dtype=float)
-
-    for label, series in active:
-        vals = series.to_numpy(dtype=float)
-        ax.bar(
-            x,
-            vals,
-            bottom=bottom,
-            width=0.64,
-            label=label,
-            zorder=3,
-        )
+    colors = {"Hall/min-cut": "#4c78a8", "Component LP": "#72b7b2", "Annual LP": "#f58518",
+              "Core-point LP": "#eeca3b", "Exact configuration": "#54a24b", "Partial logic": "#b279a2"}
+    bottom = np.zeros(len(df))
+    for col, label in active:
+        vals = _numeric(df[col]).fillna(0).to_numpy(dtype=float)
+        ax.bar(iteration, vals, bottom=bottom, width=0.58, color=colors[label], label=label)
         bottom += vals
-
-    for k, value in enumerate(bottom):
-        if value > 0:
-            ax.text(
-                x[k],
-                value,
-                f"{int(round(value))}",
-                ha="center",
-                va="bottom",
-                fontsize=8,
-            )
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(iteration.astype(str))
+    for xx, value in zip(iteration, bottom):
+        ax.text(xx, value + 0.04, str(int(round(value))), ha="center", fontsize=9)
+    ax.set_xticks(iteration)
     ax.set_xlabel("LBBD iteration")
-    ax.set_ylabel("Cuts added in iteration")
-    ax.set_title("LBBD cut generation and cumulative master enrichment")
-    ax.set_ylim(0, max(1.0, 1.25 * float(max(bottom))))
+    ax.set_ylabel("Cuts accepted in iteration")
+    ax.set_ylim(0, max(1.4, 1.30 * float(bottom.max(initial=0))))
+    ax.set_title("Outer-loop cut generation")
 
     ax2 = ax.twinx()
-    cumulative_line, = ax2.plot(
-        x,
-        cumulative.to_numpy(dtype=float),
-        marker="o",
-        linewidth=2.3,
-        label="Cumulative cuts",
-        zorder=5,
-    )
-    ax2.set_ylabel("Cumulative cuts in master")
-    ax2.set_ylim(0, max(1.0, 1.15 * float(cumulative.max())))
+    line, = ax2.plot(iteration, cumulative, marker="o", color="#d62728", linewidth=2.0, label="Cumulative accepted cuts")
+    lower = max(0, (baseline or 0) - max(1.0, 0.3 * float(outer_total.sum())))
+    ax2.set_ylim(lower, max(lower + 2.0, float(cumulative.max(initial=0)) + 1.0))
+    ax2.set_ylabel("Cumulative accepted cuts")
     ax2.grid(False)
-
-    cumulative_values = cumulative.to_numpy(dtype=float)
-    for k, value in enumerate(cumulative_values):
-        changed = k == 0 or value != cumulative_values[k - 1]
-        final = k == len(cumulative_values) - 1
-        if changed or final:
-            _annotate_xy(
-                ax2,
-                float(x[k]),
-                float(value),
-                f"{int(round(value))}",
-                color=cumulative_line.get_color(),
-                xytext=(0, 8),
-                fontsize=8,
-            )
-
+    for xx, value in zip(iteration, cumulative):
+        ax2.annotate(str(int(round(value))), (xx, value), xytext=(0, 7), textcoords="offset points", ha="center", color=line.get_color(), fontsize=8)
+    if baseline is None:
+        fig.suptitle("LBBD cuts (pre-loop accounting unavailable)")
+    else:
+        fig.suptitle(f"LBBD cuts: {pre_count} before iteration 1; {int(outer_total.sum())} in outer iterations")
+    h0, l0 = setup_ax.get_legend_handles_labels()
     h1, l1 = ax.get_legend_handles_labels()
-    _boxed_legend_below(
-        fig,
-        h1 + [cumulative_line],
-        l1 + ["Cumulative cuts"],
-        ncol=min(4, len(h1) + 1),
-        bottom=0.23,
-    )
+    _boxed_legend_below(fig, h0 + h1 + [line], l0 + l1 + ["Cumulative accepted cuts"], ncol=3, bottom=0.24)
     return _save(fig, figures_dir, "17_decomposition_cut_generation", dpi)
 
 
@@ -938,52 +1017,44 @@ def _load_lbbd_history(run_dir: Path) -> pd.DataFrame:
 
 def _plot_lbbd_cut_families(run_dir: Path, figures_dir: Path, dpi: int) -> list[str]:
     df = _load_lbbd_history(run_dir)
-
-    families = [
-        (column, label)
-        for column, label in _lbbd_cut_columns(df)
-        if column in df.columns
-    ]
+    audit, baseline = _lbbd_cut_accounting(run_dir, df, figures_dir)
+    families = [(column, label) for column, label in _lbbd_cut_columns(df) if column in df.columns]
     if not families:
         raise ValueError("LBBD history lacks cut-family columns")
-
-    totals = pd.Series({
-        label: float(_numeric(df[column]).fillna(0.0).sum())
-        for column, label in families
-    })
-
-    active = totals[totals > 0]
-    if active.empty:
+    totals = pd.Series({label: int(audit.loc[audit["cut_family"] == label, "accepted_cuts"].sum()) for _, label in families})
+    static = int(audit.loc[audit["cut_family"] == "Static origin", "accepted_cuts"].sum())
+    if static:
+        totals["Static origin"] = static
+    if not totals.sum():
         raise ValueError("No LBBD cuts were accepted")
-
-    fig, ax = plt.subplots(figsize=(8.8, 5.2))
-    y = np.arange(len(active))
-    bars = ax.barh(y, active.to_numpy(dtype=float), height=0.60)
-
+    fig, ax = plt.subplots(figsize=(9.3, 5.6))
+    y = np.arange(len(totals))
+    bars = ax.barh(y, totals.to_numpy(dtype=float), height=0.62, color=["#4c78a8" if name == "Hall/min-cut" else "#54a24b" if name == "Exact configuration" else "#9a9a9a" for name in totals.index])
     ax.set_yticks(y)
-    ax.set_yticklabels(active.index)
+    ax.set_yticklabels(totals.index)
     ax.invert_yaxis()
     ax.set_xlabel("Cuts accepted into master")
-    ax.set_title(
-        f"Accepted LBBD cuts by family "
-        f"({len(active)} of {len(families)} families active)"
-    )
-
-    maximum = max(1.0, float(active.max()))
-    ax.set_xlim(0, 1.20 * maximum)
-
-    for bar, value in zip(bars, active):
+    ax.set_title(f"Accepted LBBD cuts by family ({int(totals.sum())} total)")
+    maximum = max(1.0, float(totals.max()))
+    ax.set_xlim(0, 1.18 * maximum)
+    for bar, value in zip(bars, totals):
         ax.text(
-            bar.get_width() + 0.025 * maximum,
+            bar.get_width() + 0.02 * maximum,
             bar.get_y() + bar.get_height() / 2,
             f"{int(round(value))}",
             ha="left",
             va="center",
         )
-
+    if baseline is not None:
+        pre = audit[audit["phase"] != "outer_iteration"]
+        root = int(pre.loc[pre["phase"] == "root_screen", "accepted_cuts"].sum())
+        boot = int(pre.loc[pre["phase"] == "bootstrap_repair", "accepted_cuts"].sum())
+        outer = int(audit.loc[audit["phase"] == "outer_iteration", "accepted_cuts"].sum())
+        fig.text(0.53, 0.02, f"Before iterations: bootstrap Hall {boot}, root Hall {root}, static origin {static}; outer iterations: {outer}", ha="center", fontsize=9)
+    else:
+        fig.text(0.53, 0.02, "Pre-loop cut counts unavailable; outer iterations only", ha="center", fontsize=9)
     ax.grid(axis="x", alpha=0.25)
     ax.grid(axis="y", visible=False)
-
     return _save(fig, figures_dir, "18_lbbd_cut_families", dpi)
 
 
@@ -1016,6 +1087,11 @@ def _plot_lbbd_candidate_bounds(run_dir: Path, figures_dir: Path, dpi: int) -> l
         if "candidate_fixed_gap" in df.columns
         else pd.Series(np.nan, index=df.index)
     )
+    if "candidate_cached" in df.columns:
+        distinct = _numeric(df["candidate_cached"]).fillna(0.0) < 0.5
+        exact = exact.where(distinct)
+        fixed_ub = fixed_ub.where(distinct)
+        fixed_gap = fixed_gap.where(distinct)
 
     if exact.notna().sum() == 0:
         raise ValueError("No exact candidate certifications in LBBD history")
@@ -1025,26 +1101,40 @@ def _plot_lbbd_candidate_bounds(run_dir: Path, figures_dir: Path, dpi: int) -> l
         gridspec_kw={"height_ratios": [1.2, 0.8]},
     )
     ax_top.ticklabel_format(axis="y", style="plain", useOffset=False)
-    line_exact, = ax_top.plot(iteration, exact, marker="o", linewidth=1.9, label="Exact feasible candidate")
+    points_exact = ax_top.scatter(iteration, exact, s=48, zorder=4, label="Reported exact feasible candidate")
     if fixed_ub.notna().any():
-        ax_top.plot(iteration, fixed_ub, marker="o", linewidth=1.5, linestyle="--", label="Fixed-layout exact upper bound")
+        ax_top.scatter(iteration, fixed_ub, s=62, marker="o", facecolors="none", edgecolors="#e26a20", linewidths=1.5, zorder=5, label="Fixed-layout exact upper bound")
     if best_lb.notna().any():
         ax_top.step(iteration, best_lb, where="post", linewidth=2.2, label="Best certified incumbent")
 
-    _annotate_selected_points(ax_top, iteration, exact, lambda y: f"{y:.3f} MSEK", color=line_exact.get_color(), every=False, final=True, max_points=4)
+    _annotate_selected_points(ax_top, iteration, exact, lambda y: f"{y:.3f} MSEK", color="#1f77b4", every=False, final=True, max_points=4)
     ax_top.margins(x=0.08, y=0.22)
     ax_top.set_ylabel("Objective (million SEK/year)")
-    ax_top.set_title("Exact certification of evaluated LBBD infrastructures", pad=12)
+    ax_top.set_title("Reported exact-certified candidate by outer iteration", pad=12)
+    evaluation_audit = _lbbd_exact_evaluation_audit(run_dir, figures_dir)
+    exact_roles = _lbbd_metadata(run_dir).get("computational_complexity", {}).get("solver_log_roles", [])
+    exact_calls = len(evaluation_audit) if not evaluation_audit.empty else next((int(v["Solver calls"]) for v in exact_roles if v.get("Model role") == "exact_annual_oracle"), None)
+    shown = int(exact.notna().sum())
+    if exact_calls is not None and exact_calls > shown:
+        note = f"{exact_calls} exact MIP calls; {shown} reported iteration outcomes plotted."
+        for repair in evaluation_audit.loc[evaluation_audit["stage"] == "repair"].itertuples():
+            raw = evaluation_audit[(evaluation_audit["iteration"] == repair.iteration) & (evaluation_audit["stage"] == "trial")]
+            if not raw.empty:
+                note += f"\nIteration {repair.iteration}: raw {float(raw.iloc[0]['objective_SEK']) / 1e6:.3f} MSEK (penalized slack); repaired {float(repair.objective_SEK) / 1e6:.3f} MSEK."
+        ax_top.text(0.02, 0.035, note, transform=ax_top.transAxes, fontsize=8, va="bottom")
 
     positive_gap = fixed_gap.where(fixed_gap > 0)
     if positive_gap.notna().any():
-        line_gap, = ax_bottom.semilogy(iteration, positive_gap, marker="o", linewidth=1.9, label="Fixed-layout exact MIP gap")
-        _annotate_selected_points(ax_bottom, iteration, positive_gap, lambda y: f"{y:.5f}%", color=line_gap.get_color(), every=False, final=True, max_points=4)
+        points_gap = ax_bottom.scatter(iteration, positive_gap, s=40, label="Fixed-layout exact MIP gap")
+        ax_bottom.set_yscale("log")
+        _annotate_selected_points(ax_bottom, iteration, positive_gap, lambda y: f"{y:.5f}%", color="#1f77b4", every=False, final=True, max_points=4)
     else:
         ax_bottom.text(0.5, 0.5, "No positive fixed-layout certification gaps", transform=ax_bottom.transAxes, ha="center", va="center")
     ax_bottom.set_xlabel("LBBD iteration")
+    ax_bottom.set_xticks(iteration)
+    ax_bottom.set_xticklabels(_lbbd_source_labels(df))
     ax_bottom.set_ylabel("Exact fixed-layout gap (%)")
-    ax_bottom.set_title("Exact certification precision for each evaluated infrastructure")
+    ax_bottom.set_title("Fixed-layout precision of the reported candidates")
 
     handles1, labels1 = ax_top.get_legend_handles_labels()
     handles2, labels2 = ax_bottom.get_legend_handles_labels()
@@ -1193,26 +1283,304 @@ def _plot_lbbd_iteration_timing(run_dir: Path, figures_dir: Path, dpi: int) -> l
     if "master_solve_seconds" not in df.columns or "elapsed_seconds" not in df.columns:
         raise ValueError("LBBD history lacks timing diagnostics")
     iteration = _numeric(df["iteration"]).astype(int).to_numpy()
-    master = _numeric(df["master_solve_seconds"]).fillna(0.0).to_numpy(dtype=float)
+    master = _numeric(df["master_solve_seconds"]).fillna(0.0).to_numpy(dtype=float, copy=True)
     elapsed = _numeric(df["elapsed_seconds"]).ffill().fillna(0.0).to_numpy(dtype=float)
     iteration_total = np.diff(np.concatenate(([0.0], elapsed)))
-    other = np.maximum(0.0, iteration_total - master)
-    x = np.arange(len(iteration))
-    fig, ax = plt.subplots(figsize=(10.6, 6.3))
-    ax.bar(x, master / 60.0, label="Master solve", width=0.72)
-    ax.bar(x, other / 60.0, bottom=master / 60.0, label="Oracles, cuts and export", width=0.72)
-    ax.set_xticks(x)
-    ax.set_xticklabels(iteration.astype(str))
-    ax.set_xlabel("LBBD iteration")
-    ax.set_ylabel("Iteration time (minutes)")
-    ax.set_title("LBBD iteration runtime composition")
-    ax2 = ax.twinx()
-    line, = ax2.plot(x, elapsed / 60.0, marker="o", linewidth=2.0, linestyle="--", label="Cumulative runtime")
-    ax2.set_ylabel("Cumulative runtime (minutes)")
-    ax2.grid(False)
+    timing = _lbbd_metadata(run_dir).get("computational_complexity", {}).get("phase_timing", {})
+    end_to_end = timing.get("total_runtime_seconds")
+    outer_duration = timing.get("decomposition_solve_seconds")
+    fig, ax = plt.subplots(figsize=(11.5, 6.1))
+    if end_to_end is not None and outer_duration is not None:
+        outer = float(outer_duration)
+        finalization = float(timing.get("export_seconds", 0)) + float(timing.get("figure_generation_seconds", 0))
+        pre_loop = float(end_to_end) - outer - finalization
+        if pre_loop < -1.0 or abs(outer - float(elapsed[-1])) > 2.0:
+            raise ValueError("LBBD timing phases do not reconcile with iteration history")
+        master[0] = 0.0 if str(df.iloc[0].get("candidate_source", "")) == "lp_bootstrap" else master[0]
+        if np.any(master > iteration_total + 1.0):
+            raise ValueError("Master MIP duration exceeds the corresponding iteration duration")
+        other = np.maximum(0.0, iteration_total - master)
+        phases = np.arange(len(iteration) + 2)
+        setup = np.concatenate(([max(0.0, pre_loop)], np.zeros(len(iteration) + 1)))
+        mip = np.concatenate(([0.0], master, [0.0]))
+        auxiliary = np.concatenate(([0.0], other, [0.0]))
+        finish = np.concatenate((np.zeros(len(iteration) + 1), [finalization]))
+        ax.bar(phases, setup / 3600.0, width=0.69, label="Pre-loop (input, model build, LP bootstrap)", color="#8c8c8c")
+        ax.bar(phases, mip / 3600.0, width=0.69, label="Master MIP", color="#4c78a8")
+        ax.bar(phases, auxiliary / 3600.0, bottom=mip / 3600.0, width=0.69, label="Other outer work (LP, exact MIP, cuts)", color="#f58518")
+        ax.bar(phases, finish / 3600.0, width=0.69, label="Final export and figures", color="#54a24b")
+        total = setup + mip + auxiliary + finish
+        ax.set_xticks(phases, ["Pre-loop"] + [str(v) for v in iteration] + ["Finalize"])
+        ax.set_ylabel("Phase duration (hours)")
+        ax2 = ax.twinx()
+        line, = ax2.plot(phases, np.cumsum(total) / 3600.0, marker="o", linestyle="--", linewidth=2.0, color="#d62728", label="Cumulative end-to-end time")
+        ax2.set_ylabel("Cumulative end-to-end time (hours)")
+        ax2.grid(False)
+        ax.text(0.02, 0.97, f"Total {float(end_to_end) / 3600.0:.2f} h", transform=ax.transAxes, va="top", fontsize=9)
+        ax.set_title("LBBD runtime by execution phase")
+    else:
+        # Older run folders do not always contain a full phase-timing record.
+        other = np.maximum(0.0, iteration_total - master)
+        phases = np.arange(len(iteration))
+        ax.bar(phases, master / 3600.0, label="Reported master-solve attribution")
+        ax.bar(phases, other / 3600.0, bottom=master / 3600.0, label="Other iteration work")
+        ax.set_xticks(phases, iteration.astype(str))
+        ax.set_ylabel("Reported iteration duration (hours)")
+        ax2 = ax.twinx()
+        line, = ax2.plot(phases, elapsed / 3600.0, marker="o", linestyle="--", label="Cumulative outer-loop time")
+        ax2.set_ylabel("Cumulative outer-loop time (hours)")
+        ax2.grid(False)
+        ax.set_title("LBBD outer-loop timing (pre-loop timing unavailable)")
+    ax.set_xlabel("Execution phase / LBBD iteration")
     h1, l1 = ax.get_legend_handles_labels()
-    _boxed_legend_below(fig, h1 + [line], l1 + ["Cumulative runtime"], ncol=3, bottom=0.23)
+    _boxed_legend_below(fig, h1 + [line], l1 + [line.get_label()], ncol=3, bottom=0.23)
     return _save(fig, figures_dir, "21_lbbd_iteration_timing", dpi)
+
+
+def _is_monolithic_run(run_dir: Path) -> bool:
+    scalars = _read_csv(run_dir / "results" / "computational_complexity_scalars.csv")
+    if not scalars.empty and "Method" in scalars.columns:
+        return str(scalars.iloc[0]["Method"]).strip().lower() == "monolithic"
+    return "slackpenalty" in run_dir.name.lower()
+
+
+def _plot_monolithic_runtime(run_dir: Path, figures_dir: Path, dpi: int) -> list[str]:
+    metadata = _lbbd_metadata(run_dir).get("computational_complexity", {})
+    timing = dict(metadata.get("phase_timing", {}) or {})
+    resources = dict(metadata.get("resource_usage", {}) or {})
+    scalars = _read_csv(run_dir / "results" / "computational_complexity_scalars.csv")
+    if {"Metric", "Value"}.issubset(scalars.columns):
+        for row in scalars.itertuples(index=False):
+            if getattr(row, "Source", "") == "phase_timing":
+                timing.setdefault(str(row.Metric), row.Value)
+            elif getattr(row, "Source", "") == "resource_monitor":
+                resources.setdefault(str(row.Metric), row.Value)
+
+    def finite_nonnegative(value: object) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) and number >= 0.0 else None
+
+    total = finite_nonnegative(timing.get("total_runtime_seconds"))
+    solve = finite_nonnegative(timing.get("solve_seconds"))
+    if total is None or solve is None or total <= 0:
+        raise ValueError("Completed monolithic phase timing is unavailable; regenerate after complexity export")
+    phase_specs = [
+        ("Input", "input_load_seconds", "#4c78a8"),
+        ("Preprocess", "preprocessing_seconds", "#72b7b2"),
+        ("Build", "model_build_seconds", "#f2cf5b"),
+        ("Solve", "solve_seconds", "#f58518"),
+        ("Export", "export_seconds", "#54a24b"),
+        ("Figures", "figure_generation_seconds", "#b279a2"),
+    ]
+    durations = [(label, finite_nonnegative(timing.get(key)) or 0.0, color) for label, key, color in phase_specs]
+    recorded = sum(seconds for _, seconds, _ in durations)
+    if recorded > total + max(30.0, total * 0.001):
+        raise ValueError("Monolithic phase durations exceed recorded end-to-end runtime")
+    remainder = max(0.0, total - recorded)
+    if remainder > 0:
+        durations.append(("Other", remainder, "#a0a0a0"))
+
+    trace = _read_csv(run_dir / "results" / "resource_usage.csv")
+    if {"elapsed_seconds", "process_tree_rss_MB"}.issubset(trace.columns):
+        elapsed = _numeric(trace["elapsed_seconds"]).to_numpy(dtype=float)
+        rss = _numeric(trace["process_tree_rss_MB"]).to_numpy(dtype=float) / 1024.0
+        valid = np.isfinite(elapsed) & np.isfinite(rss) & (elapsed >= 0) & (rss >= 0)
+        elapsed, rss = elapsed[valid], rss[valid]
+    else:
+        elapsed, rss = np.array([]), np.array([])
+    if len(elapsed):
+        fig, (ax_time, ax_minor, ax_detail) = plt.subplots(
+            3, 1, figsize=(11.2, 8.3), gridspec_kw={"height_ratios": [0.7, 1.2, 1.8]}
+        )
+    else:
+        fig, (ax_time, ax_minor) = plt.subplots(
+            2, 1, figsize=(11.2, 6.0), gridspec_kw={"height_ratios": [0.7, 1.5]}
+        )
+        ax_detail = None
+    cursor = 0.0
+    for label, seconds, color in durations:
+        if seconds > 0:
+            ax_time.barh(0, seconds / 3600.0, left=cursor / 3600.0, height=0.55, color=color, label=label)
+        cursor += seconds
+    ax_time.set_xlim(0, max(total, cursor) / 3600.0 * 1.04)
+    ax_time.set_yticks([])
+    ax_time.set_xlabel("End-to-end elapsed time (hours)")
+    ax_time.set_title("Run phases; solver call includes Pyomo/Gurobi interface time", loc="left")
+    ax_time.grid(axis="y", visible=False)
+
+    short = [(label, seconds / 60.0, color) for label, seconds, color in durations if label != "Solve" and seconds > 0]
+    if short:
+        ax_minor.barh([item[0] for item in short], [item[1] for item in short], color=[item[2] for item in short])
+        ax_minor.invert_yaxis()
+        ax_minor.set_xlim(0, max(item[1] for item in short) * 1.15)
+    ax_minor.set_xlabel("Duration (minutes)")
+    ax_minor.set_title("Input, preparation, and output phases", loc="left")
+
+    if ax_detail is not None:
+        stride = max(1, math.ceil(len(elapsed) / 4000))
+        sampled = np.unique(np.append(np.arange(0, len(elapsed), stride), len(elapsed) - 1))
+        ax_detail.plot(elapsed[sampled] / 3600.0, rss[sampled], color="#4c78a8", linewidth=1.25)
+        peak_mb = finite_nonnegative(resources.get("peak_process_tree_rss_MB"))
+        peak = max(float(np.max(rss)), peak_mb / 1024.0 if peak_mb is not None else 0.0)
+        ax_detail.text(0.02, 0.96, f"Peak process-tree RSS: {peak:.1f} GiB", transform=ax_detail.transAxes, va="top", bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "none"})
+        ax_detail.set_xlim(0, max(total, float(np.max(elapsed))) / 3600.0)
+        ax_detail.set_xlabel("Elapsed time (hours)")
+        ax_detail.set_ylabel("Process-tree RSS (GiB)")
+        ax_detail.set_title("Measured process memory; distinct from Gurobi SoftMemLimit", loc="left")
+
+    certificate_path = run_dir / "results" / "solver_certificate.json"
+    certificate = json.loads(certificate_path.read_text(encoding="utf-8")) if certificate_path.exists() else {}
+    status = str(certificate.get("termination_reason", "unreported")).replace("_", " ")
+    gap = finite_nonnegative(certificate.get("gurobi_mip_gap"))
+    gap_text = f" | achieved MIP gap {100.0 * gap:.4f}%" if gap is not None else ""
+    fig.suptitle("Monolithic runtime and resource usage", y=0.98)
+    fig.text(0.08, 0.91, f"Total {total / 3600.0:.2f} h | solve {solve / 3600.0:.2f} h | termination: {status}{gap_text}", fontsize=10)
+    handles, labels = ax_time.get_legend_handles_labels()
+    _boxed_legend_below(fig, handles, labels, ncol=4, bottom=0.17)
+    fig.subplots_adjust(left=0.12, right=0.96, top=0.82, hspace=0.78)
+    return _save(fig, figures_dir, "25_monolithic_runtime_and_memory", dpi)
+
+
+def _plot_resource_memory(run_dir: Path, figures_dir: Path, dpi: int) -> list[str]:
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    trace = _read_csv(run_dir / "results" / "resource_usage.csv", required=True)
+    required = {"elapsed_seconds", "process_tree_rss_MB"}
+    if not required.issubset(trace.columns):
+        raise ValueError("Resource trace lacks elapsed_seconds or process_tree_rss_MB")
+    trace = trace.copy()
+    trace["elapsed_seconds"] = _numeric(trace["elapsed_seconds"])
+    trace["rss_gib"] = _numeric(trace["process_tree_rss_MB"]) / 1024.0
+    trace = trace.loc[
+        np.isfinite(trace["elapsed_seconds"]) & np.isfinite(trace["rss_gib"])
+        & (trace["elapsed_seconds"] >= 0) & (trace["rss_gib"] >= 0)
+    ].sort_values("elapsed_seconds").reset_index(drop=True)
+    if len(trace) < 2:
+        raise ValueError("Resource trace has fewer than two valid RSS samples")
+
+    metadata = _lbbd_metadata(run_dir)
+    complexity = metadata.get("computational_complexity", {})
+    resources = complexity.get("resource_usage", {}) or {}
+    settings = metadata.get("effective_settings", {}) or {}
+    scalars = _read_csv(run_dir / "results" / "computational_complexity_scalars.csv")
+    scalar_values = dict(zip(scalars["Metric"].astype(str), scalars["Value"])) if {"Metric", "Value"}.issubset(scalars.columns) else {}
+
+    def number(value: object) -> float | None:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        return result if math.isfinite(result) and result >= 0 else None
+
+    t = trace["elapsed_seconds"].to_numpy(dtype=float) / 3600.0
+    rss = trace["rss_gib"].to_numpy(dtype=float)
+    trace_peak = float(rss.max())
+    monitor_peak_mb = number(resources.get("peak_process_tree_rss_MB", scalar_values.get("peak_process_tree_rss_MB")))
+    monitor_peak = monitor_peak_mb / 1024.0 if monitor_peak_mb is not None else None
+    soft_limit = number(settings.get("soft_mem_limit_gb", scalar_values.get("soft_mem_limit_gb")))
+    node_start = number(settings.get("nodefile_start", scalar_values.get("nodefile_start_gb")))
+    master_threads = number(settings.get("threads", scalar_values.get("solver_threads_requested")))
+    recourse_threads = number(settings.get("subproblem_threads"))
+    node_calls = []
+    for path in sorted((run_dir / "logs").glob("*.log")):
+        with path.open("r", encoding="utf-8", errors="replace") as stream:
+            if any("Created node file directory" in line for line in stream):
+                node_calls.append(path.stem)
+
+    history = _read_csv(run_dir / "results" / "lbbd_history.csv")
+    if {"iteration", "elapsed_seconds"}.issubset(history.columns):
+        ends = history[["iteration", "elapsed_seconds"]].copy()
+        ends["iteration"] = _numeric(ends["iteration"])
+        ends["elapsed_seconds"] = _numeric(ends["elapsed_seconds"])
+        ends = ends.dropna().sort_values("elapsed_seconds")
+        ends = ends.loc[ends["elapsed_seconds"].between(0, float(trace["elapsed_seconds"].iloc[-1]) + 60)]
+    else:
+        ends = pd.DataFrame(columns=["iteration", "elapsed_seconds"])
+
+    if ends.empty:
+        fig, ax = plt.subplots(figsize=(11.5, 5.7))
+        ax_intervals = None
+    else:
+        fig, (ax, ax_intervals) = plt.subplots(
+            2, 1, figsize=(11.5, 8.0), sharex=False,
+            gridspec_kw={"height_ratios": [2.5, 1.1]},
+        )
+    if len(trace) > 6000:
+        bin_index = np.arange(len(trace)) * 2500 // len(trace)
+        groups = trace.groupby(bin_index)["rss_gib"]
+        selected = np.unique(np.concatenate(([0, len(trace) - 1], groups.idxmin().to_numpy(), groups.idxmax().to_numpy())))
+    else:
+        selected = np.arange(len(trace))
+    ax.plot(t[selected], rss[selected], color="#35618a", linewidth=0.95, label="Process-tree RSS (saved trace)")
+    peak_idx = int(rss.argmax())
+    ax.scatter([t[peak_idx]], [trace_peak], s=29, color="#b14739", zorder=5,
+               label=f"Saved-trace peak {trace_peak:.1f} GiB")
+    if monitor_peak is not None and monitor_peak > trace_peak + 0.05:
+        ax.axhline(monitor_peak, color="#b14739", linestyle=":", linewidth=1.15,
+                   label=f"Faster-monitor peak {monitor_peak:.1f} GiB")
+    for row in ends.itertuples(index=False):
+        end_h = float(row.elapsed_seconds) / 3600.0
+        ax.axvline(end_h, color="#7d806d", linestyle="--", linewidth=0.8, alpha=0.6)
+        ax.text(end_h, 0.97, f"I{int(row.iteration)}", transform=ax.get_xaxis_transform(),
+                ha="right", va="top", fontsize=8, rotation=90)
+    ax.set_xlim(0, max(float(t[-1]), 0.001) * 1.015)
+    ax.set_ylim(bottom=0)
+    ax.set_ylabel("Process-tree RSS (GiB)")
+    ax.set_xlabel("Elapsed run time (hours)")
+    ax.set_title("Measured resident memory; dashed markers denote completed LBBD iterations", loc="left")
+    ax.legend(loc="upper left", fontsize=8, framealpha=0.94)
+
+    if ax_intervals is not None:
+        interval_rows = []
+        previous = 0.0
+        for row in ends.itertuples(index=False):
+            end = float(row.elapsed_seconds)
+            if end <= previous:
+                continue
+            portion = trace.loc[(trace["elapsed_seconds"] >= previous) & (trace["elapsed_seconds"] < end), "rss_gib"]
+            if len(portion):
+                interval_rows.append((f"Start–I{int(row.iteration)}" if not interval_rows else f"I{int(row.iteration)}",
+                                      previous / 3600.0, end / 3600.0, float(portion.median()), float(portion.max()), len(portion)))
+            previous = end
+        if previous < float(trace["elapsed_seconds"].iloc[-1]):
+            portion = trace.loc[trace["elapsed_seconds"] >= previous, "rss_gib"]
+            if len(portion):
+                interval_rows.append(("Finalization", previous / 3600.0,
+                                      float(trace["elapsed_seconds"].iloc[-1]) / 3600.0,
+                                      float(portion.median()), float(portion.max()), len(portion)))
+        if interval_rows:
+            summary = pd.DataFrame(interval_rows, columns=["interval", "start_hour", "end_hour", "median_trace_rss_GiB", "peak_trace_rss_GiB", "sample_count"])
+            summary.to_csv(figures_dir / "26_memory_interval_summary.csv", index=False)
+            positions = np.arange(len(summary))
+            ax_intervals.bar(positions, summary["peak_trace_rss_GiB"], color="#b7cad9", label="Peak in saved trace")
+            ax_intervals.bar(positions, summary["median_trace_rss_GiB"], width=0.54, color="#35618a", label="Median in saved trace")
+            ax_intervals.set_xticks(positions, summary["interval"], fontsize=9)
+            ax_intervals.set_ylabel("RSS (GiB)")
+            ax_intervals.set_title("Recorded intervals (first includes initialization and bootstrap)", loc="left")
+            ax_intervals.legend(loc="upper right", ncol=2, fontsize=8)
+
+    median = float(np.median(rss))
+    p95 = float(np.quantile(rss, 0.95))
+    cadence = float(np.median(np.diff(trace["elapsed_seconds"])))
+    peak_label = f"Monitor peak {monitor_peak:.1f} GiB" if monitor_peak is not None else "Monitor peak unavailable"
+    settings_text = ", ".join(filter(None, [
+        f"NodefileStart {node_start:g} GB (configured)" if node_start is not None else None,
+        f"SoftMemLimit {soft_limit:g} GB (Gurobi allocation)" if soft_limit is not None else None,
+        f"threads {int(master_threads)}/{int(recourse_threads)} master/recourse" if master_threads is not None and recourse_threads is not None else None,
+    ]))
+    fig.suptitle("Memory use during optimization", fontsize=16, y=0.98)
+    fig.text(0.10, 0.095,
+             f"{peak_label}; saved trace: peak {trace_peak:.1f}, median {median:.1f}, P95 {p95:.1f} GiB; median sample interval {cadence:.1f} s.\n"
+             f"{settings_text or 'Solver memory settings unavailable'}. Node-file directory creation reported by {len(node_calls)} solver log(s)"
+             + (f" ({', '.join(node_calls[:3])}{'…' if len(node_calls) > 3 else ''})." if node_calls else ".")
+             + "\nNode-file disk usage was not sampled. A fall in RSS does not establish a node-file or code-saving effect."
+             + (" All saved phase labels are 'run'." if "phase" in trace.columns and trace["phase"].nunique() == 1 and str(trace["phase"].iloc[0]) == "run" else ""),
+             fontsize=8.7, va="top")
+    fig.subplots_adjust(left=0.10, right=0.97, top=0.89, bottom=0.18,
+                        hspace=0.48 if ax_intervals is not None else 0.2)
+    return _save(fig, figures_dir, "26_process_memory_profile", dpi)
 
 
 def _plot_lbbd_gap_diagnostics(run_dir: Path, figures_dir: Path, dpi: int) -> list[str]:
@@ -1232,12 +1600,18 @@ def _plot_lbbd_gap_diagnostics(run_dir: Path, figures_dir: Path, dpi: int) -> li
         values = 100.0 * _numeric(df[column])
         if column == master_col and "master_gap_is_mip" in df.columns:
             values = values.where(_numeric(df["master_gap_is_mip"]).fillna(0) > 0.5)
+        if column == "candidate_fixed_gap" and "candidate_cached" in df.columns:
+            values = values.where(_numeric(df["candidate_cached"]).fillna(0) < 0.5)
         positive = values.where(values > 0)
         if positive.notna().any():
-            ax.semilogy(iteration, positive, marker="o", linewidth=1.8, label=label)
+            if column == "lbbd_gap":
+                ax.semilogy(iteration, positive, marker="o", linewidth=1.8, label=label)
+            else:
+                ax.scatter(iteration, positive, s=54, marker="D" if column == master_col else "o", color="#54a24b" if column == master_col else "#f58518", label=label, zorder=5)
+    ax.set_xticks(iteration)
     ax.set_xlabel("LBBD iteration")
     ax.set_ylabel("Gap (%) — logarithmic scale")
-    ax.set_title("Comparable LBBD optimality-gap diagnostics")
+    ax.set_title("LBBD and Gurobi gaps (different denominators)")
     handles, labels = ax.get_legend_handles_labels()
     _boxed_legend_below(fig, handles, labels, ncol=3, bottom=0.23)
     return _save(fig, figures_dir, "22_lbbd_gap_diagnostics", dpi)
@@ -1250,6 +1624,8 @@ def _plot_lbbd_adaptive_master_control(run_dir: Path, figures_dir: Path, dpi: in
     iteration = _numeric(df["iteration"])
     certified = 100.0 * _numeric(df["lbbd_gap"])
     requested = 100.0 * _numeric(df["master_gap_requested"])
+    if "candidate_source" in df.columns:
+        requested = requested.where(~df["candidate_source"].astype(str).eq("lp_bootstrap"))
     master_col = "master_mip_gap" if "master_mip_gap" in df.columns else "master_internal_gap"
     master_actual = (
         100.0 * _numeric(df[master_col])
@@ -1258,7 +1634,7 @@ def _plot_lbbd_adaptive_master_control(run_dir: Path, figures_dir: Path, dpi: in
     if "master_gap_is_mip" in df.columns:
         master_actual = master_actual.where(_numeric(df["master_gap_is_mip"]).fillna(0) > 0.5)
 
-    fig, ax = plt.subplots(figsize=(11.0, 6.7))
+    fig, ax = plt.subplots(figsize=(10.9, 5.9))
     for values, label, style in [
         (certified, "Certified LBBD gap", "-"),
         (requested, "Requested master MIP gap", "--"),
@@ -1266,40 +1642,29 @@ def _plot_lbbd_adaptive_master_control(run_dir: Path, figures_dir: Path, dpi: in
     ]:
         positive = values.where(values > 0)
         if positive.notna().any():
-            line, = ax.semilogy(iteration, positive, marker="o", linewidth=1.9, linestyle=style, label=label)
-            _annotate_selected_points(ax, iteration, positive, lambda y: f"{y:.4f}%", color=line.get_color(), every=True, max_points=8)
+            if label == "Achieved master MIP gap":
+                ax.scatter(iteration, positive, s=72, marker="D", label=label, zorder=6, color="#54a24b")
+            else:
+                line, = ax.semilogy(iteration, positive, marker="o", linewidth=1.9, linestyle=style, label=label)
 
     plotted_values = pd.concat([certified, requested, master_actual], axis=0).dropna()
     plotted_values = plotted_values[plotted_values > 0]
     if not plotted_values.empty:
         ax.set_ylim(float(plotted_values.min()) / 1.55, float(plotted_values.max()) * 1.85)
-    ax.margins(x=0.07)
+    ax.margins(x=0.10)
     ax.set_xlabel("LBBD iteration")
+    ax.set_xticks(iteration)
+    ax.set_xticklabels(_lbbd_source_labels(df))
     ax.set_ylabel("Gap (%) — logarithmic scale")
-    ax.set_title("Adaptive LBBD master control (comparable MIP gaps only)", pad=12)
+    ax.set_title("Adaptive LBBD master control (MIP gaps where available)", pad=12)
 
+    if master_actual.notna().any():
+        valid = master_actual.dropna()
+        for idx, value in valid.items():
+            ax.annotate(f"{value:.4f}%", (iteration.loc[idx], value), xytext=(15, -16), textcoords="offset points", ha="left", fontsize=9, color="#328a39")
+    ax.text(0.98, 0.97, "Achieved MIP gap requires an incumbent and bound\nfrom the same master solve", transform=ax.transAxes, ha="right", va="top", fontsize=8)
     handles, labels = ax.get_legend_handles_labels()
-    if "candidate_source" in df.columns:
-        # Mark non-MIP candidate-generation iterations without assigning them a fake
-        # master MIP gap.  They are algorithmic events, not failed convergence points.
-        sources = df["candidate_source"].astype(str)
-        non_mip = ~sources.eq("master_mip_incumbent")
-        if non_mip.any() and not plotted_values.empty:
-            y_marker = float(plotted_values.max()) * 1.35
-            xs = iteration[non_mip]
-            ax.scatter(xs, [y_marker] * len(xs), marker="x", label="Bootstrap/fallback/bound-only iteration")
-            handles, labels = ax.get_legend_handles_labels()
-
-    if "candidate_repeat_count" in df.columns:
-        ax2 = ax.twinx()
-        repeats = _numeric(df["candidate_repeat_count"]).fillna(0.0)
-        repeat_line, = ax2.step(iteration, repeats, where="mid", linewidth=1.6, label="Consecutive repeated candidate count")
-        ax2.set_ylabel("Repeated-candidate count")
-        ax2.set_ylim(0, max(1.0, 1.20 * float(repeats.max())))
-        ax2.grid(False)
-        handles.append(repeat_line)
-        labels.append("Consecutive repeated candidate count")
-    _boxed_legend_below(fig, handles, labels, ncol=2, bottom=0.27)
+    _boxed_legend_below(fig, handles, labels, ncol=3, bottom=0.25)
     return _save(fig, figures_dir, "23_lbbd_adaptive_master_control", dpi)
 
 def _plot_lbbd_candidate_reuse(run_dir: Path, figures_dir: Path, dpi: int) -> list[str]:
@@ -1309,29 +1674,34 @@ def _plot_lbbd_candidate_reuse(run_dir: Path, figures_dir: Path, dpi: int) -> li
         raise ValueError("LBBD history lacks candidate-cache diagnostics")
     iteration = _numeric(df["iteration"]).astype(int).to_numpy()
     cached = _numeric(df["candidate_cached"]).fillna(0.0).clip(0, 1).to_numpy(dtype=float)
-    evaluated = 1.0 - cached
+    bound_only = df.get("candidate_source", pd.Series("", index=df.index)).astype(str).str.contains("bound_only").to_numpy(dtype=bool)
+    evaluated = np.where(bound_only, 0.0, 1.0 - cached)
+    reused = np.where(bound_only, 0.0, cached)
     cuts = _numeric(df["new_cuts_total"]).fillna(0.0).to_numpy(dtype=float)
-    repeats = _numeric(df["candidate_repeat_count"]).fillna(0.0).to_numpy(dtype=float)
     x = np.arange(len(iteration))
 
     fig, ax = plt.subplots(figsize=(10.7, 6.2))
-    ax.bar(x, evaluated, label="New candidate evaluated", width=0.70)
-    ax.bar(x, cached, bottom=evaluated, label="Exact result reused from cache", width=0.70)
+    ax.bar(x, evaluated, label="New exact certification in history", width=0.70)
+    ax.bar(x, reused, bottom=evaluated, label="Cached exact result reused", width=0.70)
+    ax.bar(x, bound_only.astype(float), bottom=evaluated + reused, label="Bound-only closure (no exact solve)", width=0.70)
     ax.set_xticks(x)
     ax.set_xticklabels(iteration.astype(str))
     ax.set_xlabel("LBBD iteration")
-    ax.set_ylabel("Candidate evaluation indicator")
+    ax.set_ylabel("Outer-iteration event")
     ax.set_ylim(0, 1.25)
-    ax.set_title("LBBD candidate reuse, repetition and new inference")
+    ax.set_title("LBBD candidate handling and outer-iteration cuts")
 
     ax2 = ax.twinx()
-    repeat_line, = ax2.plot(x, repeats, marker="o", linewidth=1.8, label="Repeated-candidate count")
-    cut_line, = ax2.plot(x, cuts, marker="s", linestyle="--", linewidth=1.6, label="New cuts added")
+    cut_line, = ax2.plot(x, cuts, marker="s", linestyle="--", linewidth=1.8, color="#d62728", label="Outer-iteration cuts added")
     ax2.set_ylabel("Count")
-    ax2.set_ylim(0, max(1.0, 1.20 * float(max(repeats.max(initial=0), cuts.max(initial=0)))))
+    ax2.set_ylim(0, max(1.4, 1.35 * float(cuts.max(initial=0))))
     ax2.grid(False)
+    exact_roles = _lbbd_metadata(run_dir).get("computational_complexity", {}).get("solver_log_roles", [])
+    exact_calls = next((int(v["Solver calls"]) for v in exact_roles if v.get("Model role") == "exact_annual_oracle"), None)
+    if exact_calls is not None and exact_calls > int(evaluated.sum()):
+        ax.text(0.02, 0.96, f"{exact_calls} exact MIP calls in total; repair calls may occur within an iteration", transform=ax.transAxes, ha="left", va="top", fontsize=8)
     h1, l1 = ax.get_legend_handles_labels()
-    _boxed_legend_below(fig, h1 + [repeat_line, cut_line], l1 + ["Repeated-candidate count", "New cuts added"], ncol=2, bottom=0.25)
+    _boxed_legend_below(fig, h1 + [cut_line], l1 + ["Outer-iteration cuts added"], ncol=2, bottom=0.25)
     return _save(fig, figures_dir, "24_lbbd_candidate_reuse", dpi)
 
 def _plot_slack(results_dir: Path, figures_dir: Path, dpi: int) -> list[str]:
@@ -1355,7 +1725,15 @@ def _load_geometry(path: Path):
     gdf = gpd.read_file(path)[["HexID", "geometry"]].copy()
     gdf = gdf.loc[:, ~gdf.columns.duplicated()].copy()
     gdf["HexID"] = pd.to_numeric(gdf["HexID"], errors="coerce")
-    gdf = gdf.dropna(subset=["HexID", "geometry"]).drop_duplicates("HexID")
+    gdf = gdf.dropna(subset=["HexID", "geometry"])
+    if (gdf["HexID"] % 1 != 0).any():
+        raise ValueError(f"Noninteger HexID in geometry file: {path}")
+    duplicates = gdf[gdf.duplicated("HexID", keep=False)]
+    for cell_id, group in duplicates.groupby("HexID"):
+        shapes = group.geometry.tolist()
+        if any(not shapes[0].equals(other) for other in shapes[1:]):
+            raise ValueError(f"Conflicting polygons for HexID {int(cell_id)} in {path}")
+    gdf = gdf.drop_duplicates("HexID")
     gdf["HexID"] = gdf["HexID"].astype(int)
     if gdf.crs is None:
         raise ValueError(f"Geometry file has no CRS: {path}")
@@ -1391,6 +1769,7 @@ def _plot_choropleth(
     cmap: str = "viridis",
     symmetric: bool = False,
     basemap_alpha: float = 0.25,
+    basemap_source: str = "auto",
 ) -> list[str]:
     if column not in merged.columns:
         raise ValueError(f"Missing map column: {column}")
@@ -1398,7 +1777,7 @@ def _plot_choropleth(
     base3857 = base.to_crs(epsg=3857)
     fig, ax = plt.subplots(figsize=(10.5, 10.5))
     base3857.boundary.plot(ax=ax, linewidth=0.15, alpha=0.15, color="0.35", zorder=1)
-    _add_basemap(ax, alpha=basemap_alpha)
+    _add_basemap(ax, alpha=basemap_alpha, source=basemap_source)
     values = pd.to_numeric(merged3857[column], errors="coerce").fillna(0.0)
     merged3857[column] = values
     kwargs = {
@@ -1425,6 +1804,13 @@ def _plot_choropleth(
     return _save(fig, figures_dir, stem, dpi)
 
 
+def _great_circle_km(p1, p2) -> float:
+    lon1, lat1, lon2, lat2 = map(math.radians, (p1.x, p1.y, p2.x, p2.y))
+    dlon, dlat = lon2 - lon1, lat2 - lat1
+    a = math.sin(dlat / 2.0) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2.0) ** 2
+    return 6371.0088 * 2.0 * math.asin(min(1.0, math.sqrt(max(0.0, a))))
+
+
 def _plot_redirection_corridors(
     redir: pd.DataFrame,
     merged,
@@ -1434,35 +1820,70 @@ def _plot_redirection_corridors(
     max_flow_arcs: int,
     month: str,
     basemap_alpha: float,
+    basemap_source: str = "auto",
+    distance_limit_km: float = 1.5,
 ) -> list[str]:
-    required = {"from_HexID", "to_HexID", "Month", "Energy_kWh_day"}
+    required = {"from_HexID", "to_HexID", "Month", "Energy_kWh_day", "Distance_km"}
     if not required.issubset(redir.columns):
         raise ValueError(f"redirections.csv lacks columns: {sorted(required - set(redir.columns))}")
     sub = redir[redir["Month"].astype(str) == month].copy()
     if sub.empty:
         raise ValueError(f"No positive redirection flows for {month}")
     sub["Energy_kWh_day"] = pd.to_numeric(sub["Energy_kWh_day"], errors="coerce").fillna(0.0)
-    agg = (
-        sub.groupby(["from_HexID", "to_HexID"], as_index=False)["Energy_kWh_day"]
-        .sum()
+    sub["Distance_km"] = pd.to_numeric(sub["Distance_km"], errors="coerce")
+    flows = (
+        sub.groupby(["from_HexID", "to_HexID"], as_index=False)
+        .agg(Energy_kWh_day=("Energy_kWh_day", "sum"),
+             reported_distance_min_km=("Distance_km", "min"),
+             reported_distance_max_km=("Distance_km", "max"))
         .query("Energy_kWh_day > 0")
-        .nlargest(max(1, int(max_flow_arcs)), "Energy_kWh_day")
     )
-    if agg.empty:
+    if flows.empty:
         raise ValueError(f"No positive aggregated redirection corridors for {month}")
 
     merged3857 = merged.to_crs(epsg=3857)
     base3857 = base.to_crs(epsg=3857)
     cent = merged3857.set_index("HexID").geometry.centroid
+    cent_geo = cent.to_crs(epsg=4326)
+    chosen = set(flows.nlargest(max(1, int(max_flow_arcs)), "Energy_kWh_day").index)
+    diagnostics = []
     rows = []
-    for _, row in agg.iterrows():
+    for idx, row in flows.iterrows():
         i, j = int(row["from_HexID"]), int(row["to_HexID"])
-        if i not in cent.index or j not in cent.index:
-            continue
-        p1, p2 = cent.loc[i], cent.loc[j]
-        if p1.equals(p2):
-            continue
-        rows.append((p1.x, p1.y, p2.x, p2.y, float(row["Energy_kWh_day"])))
+        found = i in cent.index and j in cent.index
+        reported = float(row["reported_distance_max_km"])
+        metric = _great_circle_km(cent_geo.loc[i], cent_geo.loc[j]) if found else math.nan
+        web = cent.loc[i].distance(cent.loc[j]) / 1000.0 if found else math.nan
+        inconsistent = bool(
+            math.isfinite(reported)
+            and reported - float(row["reported_distance_min_km"]) > 0.001
+        )
+        over_limit = bool(math.isfinite(metric) and metric > distance_limit_km + 0.02)
+        over_reported = bool(math.isfinite(metric) and math.isfinite(reported) and metric > reported + 0.10)
+        flag = not found or not math.isfinite(reported) or inconsistent or over_limit or over_reported
+        diagnostics.append({
+            "from_HexID": i, "to_HexID": j,
+            "Energy_kWh_day": float(row["Energy_kWh_day"]),
+            "reported_distance_min_km": row["reported_distance_min_km"],
+            "reported_distance_max_km": reported,
+            "centroid_distance_km": metric,
+            "web_mercator_span_km_not_ground_distance": web,
+            "distance_limit_km": distance_limit_km,
+            "missing_hex_geometry": not found,
+            "inconsistent_reported_distance": inconsistent,
+            "centroid_exceeds_limit": over_limit,
+            "centroid_exceeds_reported_distance": over_reported,
+            "requires_spatial_review": flag,
+            "selected_for_map": idx in chosen,
+        })
+        if idx in chosen and found and not cent.loc[i].equals(cent.loc[j]):
+            p1, p2 = cent.loc[i], cent.loc[j]
+            rows.append((p1.x, p1.y, p2.x, p2.y, float(row["Energy_kWh_day"]), flag))
+    audit_path = figures_dir / f"15_redirection_corridor_distance_audit_{month.lower()}.csv"
+    pd.DataFrame(diagnostics).sort_values("Energy_kWh_day", ascending=False).to_csv(audit_path, index=False)
+    flagged_count = sum(r[5] for r in rows)
+    if flagged_count:
+        print(f"WARNING: {flagged_count} plotted {month} redirection corridors need spatial review; see {audit_path.name}")
     if not rows:
         raise ValueError(f"No redirection corridors could be matched to geometry for {month}")
 
@@ -1470,23 +1891,24 @@ def _plot_redirection_corridors(
     max_weight = max(float(weights.max()), 1e-12)
     fig, ax = plt.subplots(figsize=(12, 12))
     base3857.boundary.plot(ax=ax, color="0.45", linewidth=0.30, alpha=0.20, zorder=1)
-    _add_basemap(ax, alpha=basemap_alpha)
+    _add_basemap(ax, alpha=basemap_alpha, source=basemap_source)
     base3857.boundary.plot(ax=ax, color="0.35", linewidth=0.28, alpha=0.28, zorder=2)
 
-    for fx, fy, tx, ty, energy in sorted(rows, key=lambda r: r[4]):
+    for fx, fy, tx, ty, energy, flagged in sorted(rows, key=lambda r: r[4]):
         lw = 0.6 + 3.6 * math.sqrt(max(energy, 0.0) / max_weight)
         arrow = FancyArrowPatch(
             (fx, fy),
             (tx, ty),
             arrowstyle="-|>",
             linewidth=lw,
-            edgecolor="black",
-            facecolor="lightgray",
+            edgecolor="#b2182b" if flagged else "black",
+            facecolor="#b2182b" if flagged else "lightgray",
+            linestyle="--" if flagged else "-",
             mutation_scale=5.5 + 2.4 * lw,
             alpha=0.78,
             shrinkA=1.5,
             shrinkB=1.5,
-            zorder=3,
+            zorder=4 if flagged else 3,
         )
         ax.add_patch(arrow)
 
@@ -1499,6 +1921,9 @@ def _plot_redirection_corridors(
         else:
             label = f"{value:,.1f} kWh/day"
         legend_handles.append(Line2D([], [], color="black", linewidth=lw, label=label))
+    if flagged_count:
+        legend_handles.append(Line2D([], [], color="#b2182b", linestyle="--", linewidth=2,
+                                     label=f"Spatial review: {flagged_count} shown"))
     fig.legend(
         handles=legend_handles,
         title="Corridor energy",
@@ -1512,7 +1937,8 @@ def _plot_redirection_corridors(
     )
     ax.set_axis_off()
     ax.set_aspect("equal")
-    ax.set_title(f"{month}: redirected charging-demand corridors\nTop {len(rows)} origin–destination flows")
+    ax.set_title(f"{month}: redirected charging-demand corridors\nTop {len(rows)} origin–destination flows"
+                 + (f"; {flagged_count} need distance review" if flagged_count else ""))
     fig.subplots_adjust(bottom=0.105, top=0.92)
     return _save(fig, figures_dir, f"15_map_redirection_corridors_{month.lower()}", dpi)
 
@@ -1525,21 +1951,25 @@ def _plot_maps(
     max_flow_arcs: int,
     redirection_month: str = "June",
     basemap_alpha: float = 0.28,
+    basemap_source: str = "auto",
+    distance_limit_km: float = 1.5,
 ) -> list[str]:
     base, merged = _merge_geometry(results_dir, geometry_path)
     outputs: list[str] = []
     outputs += _plot_choropleth(
         merged, base, "Total_public_capacity_kWh_slot", "Installed public charging capacity",
         "kWh per 30-minute slot", figures_dir, "11_map_public_charging_capacity", dpi,
-        basemap_alpha=basemap_alpha,
+        basemap_alpha=basemap_alpha, basemap_source=basemap_source,
     )
     outputs += _plot_choropleth(
         merged, base, "PV_panels", "Installed PV panels", "PV panels",
-        figures_dir, "12_map_pv_installation", dpi, basemap_alpha=basemap_alpha,
+        figures_dir, "12_map_pv_installation", dpi,
+        basemap_alpha=basemap_alpha, basemap_source=basemap_source,
     )
     outputs += _plot_choropleth(
         merged, base, "Battery_units", "Installed BESS units", "10-kWh BESS units",
-        figures_dir, "13_map_bess_installation", dpi, basemap_alpha=basemap_alpha,
+        figures_dir, "13_map_bess_installation", dpi,
+        basemap_alpha=basemap_alpha, basemap_source=basemap_source,
     )
 
     redir = _read_csv(results_dir / "redirections.csv")
@@ -1552,10 +1982,12 @@ def _plot_maps(
             merged, base, "Net_redirection_in_kWh_annual", "Net annual redirected energy by cell",
             "Incoming minus outgoing kWh/year", figures_dir, "14_map_net_redirection", dpi,
             cmap="coolwarm", symmetric=True, basemap_alpha=basemap_alpha,
+            basemap_source=basemap_source,
         )
         outputs += _plot_redirection_corridors(
             redir, merged, base, figures_dir, dpi, max_flow_arcs,
             month=redirection_month, basemap_alpha=basemap_alpha,
+            basemap_source=basemap_source, distance_limit_km=distance_limit_km,
         )
     return outputs
 
@@ -1584,8 +2016,25 @@ which figure groups were generated, skipped, or failed.
 - `10_slack_by_month.png` is generated only when positive unmet demand exists. A skipped slack figure
   normally means the optimized solution had zero positive slack.
 - `11_map_public_charging_capacity.png` through `15_map_redirection_corridors_<month>.png` are spatial
-  maps. If `contextily` or internet access is unavailable, maps are still generated from the vector geometry.
+  maps. CARTO raster tiles require a key in `CARTO_BASEMAP_API_KEY`. With no key, the default
+  uses OpenStreetMap tiles if `contextily` supports custom request headers; otherwise vector
+  geometry is retained. Source attribution must remain legible on published maps.
+- `15_redirection_corridor_distance_audit_<month>.csv` checks every exported corridor in the
+  selected month against hex-centroid great-circle distance. Red dashed arrows require spatial
+  review; a mismatch does not establish which input is wrong. Web Mercator span is not ground
+  distance. Check the model's shortest-path distance table and shapefile ID/CRS before publication.
 - `16_demand_supply_balance_annual_average.png` compares home and public charging supply accounting.
+- `25_monolithic_runtime_and_memory.png` shows recorded end-to-end monolithic run phases and
+  process-tree RSS where available. Generate it again after the run has written its complexity
+  metadata; it cannot use LBBD iteration timing for a monolithic solve.
+- `26_process_memory_profile.png` shows measured process-tree RSS over time, including
+  iteration-end markers and per-interval statistics where LBBD history exists. The monitor's
+  faster peak is distinguished from the saved five-second trace peak. It reports solver memory
+  settings and the solver calls that logged node-file-directory creation; node-file disk bytes
+  were not monitored. The CSV's `process_tree_rss_MB` is bytes divided by 1024 squared, and is
+  converted to GiB by dividing by another 1024. `26_memory_interval_summary.csv` contains
+  the numerical interval values.
+  Regenerate figures after `resource_usage.csv` and run complexity metadata have been exported.
 
 ## How to read decomposition figures
 
@@ -1593,31 +2042,28 @@ which figure groups were generated, skipped, or failed.
   global master bound. The lower-bound line is the best exact feasible incumbent. The dashed gap line
   is `(UB - LB) / max(1, |UB|)` in percent.
 
-- `17_decomposition_cut_generation.png` shows cuts accepted in each decomposition iteration and the cumulative enrichment of the master.
-  For LBBD, accepted cuts are stacked by cut family.
+- `17_decomposition_cut_generation.png` separates accepted pre-loop cuts (root and LP-bootstrap Hall cuts, plus any static origin cuts) from cuts added in each outer iteration. The cumulative line includes both phases.
+  `lbbd_cut_accounting.csv` lists the accepted counts by phase, iteration and family. Hall cuts preserve penalized unmet-demand slack.
 
-- `18_lbbd_cut_families.png` summarizes the LBBD cut families that actually contributed constraints to the master.
+- `18_lbbd_cut_families.png` includes all recorded LBBD cut families, including bootstrap Hall cuts, and displays zero-count families explicitly. Accepted inference cuts are distinct from Gurobi's internal cutting planes.
 
-- `19_lbbd_candidate_bounds.png` shows exact candidate profit, fixed-infrastructure upper bounds, the best certified incumbent,
-  and exact fixed-infrastructure certification gaps.
+- `19_lbbd_candidate_bounds.png` shows the reported exact-certified iteration outcome, its fixed-infrastructure upper bound, the best certified incumbent, and fixed-infrastructure certification gap. A repair can cause more than one exact MIP call within an iteration; the history stores the final reported outcome. `lbbd_exact_evaluations.csv` separately lists every exact solver call extracted from the archived solver-log statistics, including raw slack-penalized trial objectives and repair objectives where available.
 
 - `20_lbbd_infrastructure_evolution.png` shows the actual charger, photovoltaic-panel, and battery-unit counts of the best certified
   infrastructure across LBBD iterations.
 
-- `21_lbbd_iteration_timing.png` separates master-solve time from oracle/cut/export time and shows the cumulative runtime.
+- `21_lbbd_iteration_timing.png` shows pre-loop preparation and LP bootstrap, each outer iteration, and final export/figures as distinct phases. Its cumulative curve covers the complete end-to-end run. The LP-bootstrap solve is attributed to pre-loop rather than counted again as an iteration-1 master MIP.
 
-- `22_lbbd_gap_diagnostics.png` compares the global LBBD gap, master MIP gap, and exact fixed-layout MIP gap on a logarithmic scale.
+- `22_lbbd_gap_diagnostics.png` compares the global LBBD gap, achieved master MIP gap where an incumbent and bound came from the same master solve, and exact fixed-layout gaps for newly certified outcomes. Cached or bound-only iterations do not create new fixed-layout gap points.
 
-- `23_lbbd_adaptive_master_control.png` verifies that the requested trial-master gap tightens as the certified LBBD gap decreases. This is important because a loose trial-master MIP gap can stall outer-loop
-  convergence.
+- `23_lbbd_adaptive_master_control.png` compares requested master MIP tolerance and genuine achieved master MIP gaps with the certified outer gap. The LP bootstrap has no requested MIP solve, while fallback and bound-only iterations have no achieved master MIP gap without a master incumbent.
   
-- `24_lbbd_candidate_reuse.png` shows whether an iteration evaluated a new infrastructure candidate or
-  reused an exact result from the internal cache, together with repeated-candidate counts and new cuts.
+- `24_lbbd_candidate_reuse.png` distinguishes a new exact-certified outcome, a cache hit, and a bound-only termination without a new exact solve. Its cut line counts outer-iteration additions only; the bootstrap cuts appear in figures 17 and 18.
 
 ## Regenerating figures
 
 ```powershell
-python src\\visualize_results.py --run-dir "runs\\<RUN_FOLDER>" --dataset small --dpi 300 --redirection-map-month June
+python src\\visualize_results.py --run-dir "runs\\<RUN_FOLDER>" --dataset full --dpi 300 --redirection-map-month June
 ```
 """
     (figures_dir / "README_FIGURES.md").write_text(text, encoding="utf-8")
@@ -1633,6 +2079,8 @@ def generate_run_figures(
     max_flow_arcs: int = 150,
     redirection_map_month: str = "June",
     basemap_alpha: float = 0.28,
+    basemap_source: str = "auto",
+    redirection_distance_limit_km: float | None = None,
 ) -> pd.DataFrame:
     run_dir = Path(run_dir).resolve()
     project_root = Path(project_root).resolve() if project_root else Path(__file__).resolve().parents[1]
@@ -1644,6 +2092,12 @@ def generate_run_figures(
     _setup_style()
     dataset = dataset or _infer_dataset(run_dir)
     geometry_path = _resolve_geometry(project_root, dataset, parking_shapefile)
+    if redirection_distance_limit_km is None:
+        config_path = project_root / "config" / "model_config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+        redirection_distance_limit_km = float(config.get("max_redirection_distance_km", 1.5))
+    if not math.isfinite(redirection_distance_limit_km) or redirection_distance_limit_km <= 0:
+        raise ValueError("Redirection distance limit must be positive and finite")
 
     tasks: list[tuple[str, Callable[[], list[str]]]] = [
         ("economic_breakdown", lambda: _plot_economic_breakdown(results_dir, figures_dir, dpi)),
@@ -1675,6 +2129,10 @@ def generate_run_figures(
         ("lbbd_candidate_reuse", lambda: _plot_lbbd_candidate_reuse(run_dir, figures_dir, dpi)),
         ("slack", lambda: _plot_slack(results_dir, figures_dir, dpi)),
     ]
+    if _is_monolithic_run(run_dir):
+        tasks.append(("monolithic_runtime", lambda: _plot_monolithic_runtime(run_dir, figures_dir, dpi)))
+    if (results_dir / "resource_usage.csv").exists():
+        tasks.append(("resource_memory", lambda: _plot_resource_memory(run_dir, figures_dir, dpi)))
     if geometry_path is not None and geometry_path.exists():
         tasks.append(("spatial_maps", lambda: _plot_maps(
             results_dir,
@@ -1684,6 +2142,8 @@ def generate_run_figures(
             max_flow_arcs,
             redirection_month=redirection_map_month,
             basemap_alpha=basemap_alpha,
+            basemap_source=basemap_source,
+            distance_limit_km=redirection_distance_limit_km,
         )))
 
     records = []
@@ -1718,6 +2178,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-flow-arcs", type=int, default=150)
     parser.add_argument("--redirection-map-month", choices=MONTHS, default="June")
     parser.add_argument("--basemap-alpha", type=float, default=0.28)
+    parser.add_argument("--basemap-source", choices=["auto", "carto", "osm", "none"], default="auto")
+    parser.add_argument("--redirection-distance-limit-km", type=float, default=None)
     return parser.parse_args()
 
 
@@ -1732,6 +2194,8 @@ def main() -> int:
         max_flow_arcs=max(1, int(args.max_flow_arcs)),
         redirection_map_month=args.redirection_map_month,
         basemap_alpha=min(1.0, max(0.0, float(args.basemap_alpha))),
+        basemap_source=args.basemap_source,
+        redirection_distance_limit_km=args.redirection_distance_limit_km,
     )
     return 0
 

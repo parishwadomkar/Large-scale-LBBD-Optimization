@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import os
 import sys
 import time
@@ -22,7 +23,7 @@ from utils import ensure_dir, load_json, resolve_project_path
 from data_loader import check_input_paths, load_inputs
 from preprocessing import preprocess
 from model_builder import apply_scenario, apply_hard_no_slack, build_model
-from solve_model import solve_model
+from solve_model import solve_model, solver_certificate
 from export_results import export_all, print_summary
 from visualize_results import generate_run_figures
 from run_profiles import apply_profile_defaults, load_run_profile
@@ -490,12 +491,25 @@ def _run_optimization_impl(
     results = solve_model(model, solver_cfg, run_dir)
     phase_timing["solve_seconds"] = time.perf_counter() - phase_started
     print(results.solver)
+    certificate = solver_certificate(results, model, run_dir / "logs" / "gurobi_run.log")
+    certificate["requested_mip_gap"] = solver_cfg.get("mip_gap")
+    (run_dir / "results" / "solver_certificate.json").write_text(
+        json.dumps(certificate, indent=2), encoding="utf-8"
+    )
+    print(f"Solver certificate: {certificate}")
 
     term = str(results.solver.termination_condition).lower()
-    if "infeasible" in term:
+    solver_limited = certificate["termination_reason"] in {
+        "time_limit", "memory_limit", "objective_limit", "other_usable_termination"
+    }
+    if solver_limited and certificate["has_loaded_incumbent"]:
         print(
-            "\nModel is infeasible under the current options. "
-            "If --hard-no-slack was used, rerun without it and inspect slack diagnostics."
+            "Solver stopped at a configured/resource limit with a feasible incumbent. "
+            "The incumbent will be exported, but the requested MIP gap may not have been reached."
+        )
+    if not certificate["has_loaded_incumbent"]:
+        print(
+            "\nNo feasible incumbent was loaded; only the solver certificate and complexity diagnostics can be exported."
         )
         print(f"Run directory: {run_dir}")
         monitor.stop()
@@ -505,7 +519,8 @@ def _run_optimization_impl(
             phase_timing=phase_timing,
             model_stats={"main_model": main_model_stats},
             resource_monitor=monitor,
-            extra_scalars={"termination_infeasible": 1},
+            extra_scalars={"termination_reason": certificate["termination_reason"],
+                           "valid_bound_SEK": certificate["valid_bound_SEK"]},
         )
         return 2
 
@@ -544,10 +559,23 @@ def _run_optimization_impl(
             "nodefile_start_gb": solver_cfg.get("nodefile_start_gb"),
             "nodefile_dir": solver_cfg.get("nodefile_dir"),
             "soft_mem_limit_gb": solver_cfg.get("soft_mem_limit_gb"),
+            "solver_limited_with_incumbent": int(bool(solver_limited)),
+            "solver_termination_condition": term,
+            "termination_reason": certificate["termination_reason"],
+            "incumbent_objective_SEK": certificate["objective_SEK"],
+            "valid_bound_SEK": certificate["valid_bound_SEK"],
+            "achieved_mip_gap": certificate["gurobi_mip_gap"],
         },
     )
 
-    print(f"Run finished successfully. Run directory: {run_dir}")
+    if solver_limited:
+        print(
+            "Run finished with a feasible incumbent after a solver/resource limit; "
+            "results were exported, but this is not a requested-gap convergence claim. "
+            f"Run directory: {run_dir}"
+        )
+    else:
+        print(f"Run finished successfully. Run directory: {run_dir}")
     return 0
 
 

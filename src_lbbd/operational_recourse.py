@@ -5,9 +5,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pyomo.environ as pyo
-from pyomo.opt import TerminationCondition
+from pyomo.opt import SolverStatus, TerminationCondition
 
 from decomposition_types import LPBendersCut
+from solve_model import _gurobi_log_has_soft_memory_stop
 
 
 @dataclass
@@ -202,7 +203,7 @@ def _solve(
         opt.options["MIPFocus"] = int(base.get("mip_focus", 1))
     else:
         opt.options["Method"] = 1
-    kwargs = {"tee": tee, "load_solutions": True}
+    kwargs = {"tee": tee, "load_solutions": False}
     has_start = model._exact_mip and any(
         model.e[i, t, c, b].value is not None
         for i in model.I for t in model.H for c in model.C for b in model.B
@@ -210,10 +211,14 @@ def _solve(
     if has_start and hasattr(opt, "warm_start_capable") and opt.warm_start_capable():
         kwargs["warmstart"] = True
     results = opt.solve(model, **kwargs)
+    if results.solver.status == SolverStatus.error and _gurobi_log_has_soft_memory_stop(log_file):
+        results.solver.status = SolverStatus.aborted
+        results.solver.termination_condition = TerminationCondition.resourceInterrupt
     if not model._exact_mip and results.solver.termination_condition != TerminationCondition.optimal:
         raise RuntimeError(f"Monthly recourse LP {model._month} failed: {results.solver.status}, {results.solver.termination_condition}")
-    if model._exact_mip and not all(model.e[i, t, c, b].value is not None for i in model.I for t in model.H for c in model.C for b in model.B):
-        raise RuntimeError(f"Monthly recourse MIP {model._month} returned no feasible incumbent: {results.solver.status}, {results.solver.termination_condition}")
+    if not getattr(results, "solution", None) or str(results.solver.status).lower() == "error":
+        raise RuntimeError(f"Monthly recourse {model._month} returned no loadable solution: {results.solver.status}, {results.solver.termination_condition}")
+    model.solutions.load_from(results)
     return results
 
 
@@ -354,7 +359,6 @@ def _component_cut(model, data: dict, components: dict, key: tuple[str, int, int
     coefficients = {
         k: (0.0 if -tolerance <= v < 0.0 else v)
         for k, v in coefficients.items()
-        if abs(v) > 1e-10
     }
     rhs_at_incumbent = constant + sum(
         float(coefficients.get(k, 0.0)) * float(x_values[k]) for k in x_values

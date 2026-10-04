@@ -1,0 +1,10 @@
+{
+  "termination_reason": "memory_limit",
+  "pyomo_termination": "resourceInterrupt",
+  "pyomo_status": "aborted",
+  "has_loaded_incumbent": true,
+  "objective_SEK": 503750263.69632816,
+  "valid_bound_SEK": 504051176.0283356,
+  "gurobi_mip_gap": 0.0005973442669775053,
+  "requested_mip_gap": 0.0002
+}

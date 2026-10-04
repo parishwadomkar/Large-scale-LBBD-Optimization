@@ -1,21 +1,5 @@
-.vscode/
-.DS_Store
-Thumbs.db
 __pycache__/
 *.py[cod]
-*$py.class
-.venv/
-venv/
-.env
-
-# Solver scratch / transient files
-*.lp
-*.mps
-*.mst
-*.sol
-*.log
+*.node
 runs/**/nodefiles/
-runs/gurobi_nodefiles/
-
-.ipynb_checkpoints/
-*.zip
+runs/gurobi_*_nodefiles/

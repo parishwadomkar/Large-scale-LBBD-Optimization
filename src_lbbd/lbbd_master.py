@@ -506,6 +506,8 @@ def _configuration_mismatch(model: pyo.ConcreteModel, investment: InvestmentPoin
 
 
 def add_exact_config_cut(model: pyo.ConcreteModel, cut: ExactConfigCut) -> bool:
+    if not math.isfinite(float(cut.upper_bound)):
+        raise ValueError("An exact-configuration cut requires a finite proven upper bound")
     signature = (
         tuple(sorted((int(i), str(c), int(v)) for (i, c), v in cut.investment.x.items())),
         tuple(sorted((int(i), int(v)) for i, v in cut.investment.pv.items())),
@@ -538,7 +540,8 @@ def component_lp_cut_violation(model: pyo.ConcreteModel, cut: LPBendersCut, x_va
 
 def add_component_lp_cut(model: pyo.ConcreteModel, cut: LPBendersCut, tolerance: float = 1e-10) -> bool:
     key = (str(cut.month), int(cut.time_index), int(cut.component_id))
-    coeff = {(int(i), str(c)): float(v) for (i, c), v in cut.coefficients.items() if abs(float(v)) > tolerance}
+    # Omitting a small positive term could lower an upper cut at another layout.
+    coeff = {(int(i), str(c)): float(v) for (i, c), v in cut.coefficients.items()}
     signature = (
         key, round(float(cut.constant), 6),
         tuple(sorted((i, c, round(v, 6)) for (i, c), v in coeff.items())),
@@ -643,9 +646,9 @@ def add_annual_lp_cut(model: pyo.ConcreteModel, cut: AnnualLPDualCut, tolerance:
     if signature in model._annual_lp_signatures:
         return False
     rhs = float(cut.constant)
-    rhs += pyo.quicksum(float(v) * model.x[int(i), str(c)] for (i, c), v in cut.x_coefficients.items() if abs(float(v)) > tolerance)
-    rhs += pyo.quicksum(float(v) * model.PV[int(i)] for i, v in cut.pv_coefficients.items() if abs(float(v)) > tolerance)
-    rhs += pyo.quicksum(float(v) * model.Batt[int(i)] for i, v in cut.batt_coefficients.items() if abs(float(v)) > tolerance)
+    rhs += pyo.quicksum(float(v) * model.x[int(i), str(c)] for (i, c), v in cut.x_coefficients.items())
+    rhs += pyo.quicksum(float(v) * model.PV[int(i)] for i, v in cut.pv_coefficients.items())
+    rhs += pyo.quicksum(float(v) * model.Batt[int(i)] for i, v in cut.batt_coefficients.items())
     model.AnnualLPCuts.add(model.Eta <= rhs)
     model._annual_lp_signatures.add(signature)
     return True

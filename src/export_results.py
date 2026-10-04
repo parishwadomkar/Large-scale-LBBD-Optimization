@@ -511,7 +511,7 @@ def export_all(model, data: dict, cfg: dict, run_dir: Path) -> dict[str, pd.Data
 
 def print_summary(model, data: dict, cfg: dict) -> None:
     metrics = compute_core_metrics(model, data, cfg)
-    print("\n================  OPTIMAL ANNUAL PROFIT  ================")
+    print("\n===============  BEST FEASIBLE ANNUAL PROFIT  ===============")
     print(f"Total profit : {metrics['annual_profit_SEK']:,.0f} SEK / yr\n")
     print("==================  BREAKDOWN  =================")
     print(f"Revenue (all chargers)             : {metrics['revenue_all_chargers_SEK']:>13,.0f}")
