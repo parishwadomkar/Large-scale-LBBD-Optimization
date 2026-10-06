@@ -72,7 +72,13 @@ def _detect_method(run_dir: Path) -> str:
                 return "lbbd"
             if "monolithic" in text:
                 return "monolithic"
-    probe = f"{run_dir.name}\n{_read_text(run_dir / 'README_RUN.txt')[:2500]}".lower()
+    folder_readme = _read_text(run_dir / "README_RUN_FOLDER.txt")[:200].lower()
+    if folder_readme.startswith("monolithic optimization run folder"):
+        return "monolithic"
+    transcript_header = _read_text(run_dir / "README_RUN.txt")[:200].lower()
+    if "monolithic terminal log" in transcript_header:
+        return "monolithic"
+    probe = run_dir.name.lower()
     if "lbbd" in probe:
         return "lbbd"
     if "benders" in probe:
