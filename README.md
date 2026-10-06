@@ -99,7 +99,7 @@ Small LBBD run:
 python src_lbbd\run_lbbd.py --dataset small --scenario with_redirection --threads 10 --master-gap 0.0001 --subproblem-gap 0.00001 --lbbd-gap 0.0001
 ```
 
-Full cold-start LBBD example (the detailed command and settings are in [`runs/terminal.txt`](runs/terminal.txt)):
+Full cold-start LBBD example (the detailed command and settings are in [`runs/terminalruns.txt`](runs/terminalruns.txt)):
 
 ```powershell
 python src_lbbd\run_lbbd.py --dataset full --scenario with_redirection --threads 10 --subproblem-threads 2 --lbbd-gap 0.0002 --subproblem-gap 0.00001 --max-iterations 16 --time-limit 1728000 --soft-mem-limit-gb 180 --nodefile-start 0.5 --nodefile-dir "runs\gurobi_nodefiles" --bound-polish
@@ -204,7 +204,7 @@ For this maximization model, the LBBD certificate uses its valid global master u
 
 Large full-data runs need enough RAM, explicit time and Gurobi soft-memory limits, and a fast local node-file directory. The full LBBD profile requests dual simplex for its large root and node LP relaxations. `NodefileStart` affects branch-and-bound tree storage after branching begins..It cannot reduce memory needed to build or solve the root relaxation.
 
-For full LBBD runs, use dedicated `--master-gap`, `--lbbd-gap`, and `--subproblem-gap` controls: a loose `--mip-gap` also loosens annual recourse certification. Cold runs must omit external restart/investment options. Record the code commit, input/configuration versions, solver version, and effective settings in each run folder; [`runs/terminal.txt`](runs/terminal.txt) provides the command matrix.
+For full LBBD runs, use dedicated `--master-gap`, `--lbbd-gap`, and `--subproblem-gap` controls: a loose `--mip-gap` also loosens annual recourse certification. Cold runs must omit external restart/investment options. Record the code commit, input/configuration versions, solver version, and effective settings in each run folder; [`runs/terminalruns.txt`](runs/terminalruns.txt) provides the command matrix.
 
 ---
 
@@ -224,7 +224,7 @@ For issues, feature requests, or reproducibility questions, please open a GitHub
 
 ### Charging infrastructure optimization
 
-**Parishwad, Omkar; Najafi, Arsalan; Gao, Kun** — *User redirection-aware co-optimization of public charging with local photovoltaics and battery storage.*
+**Parishwad, Omkar; Najafi, Arsalan; Yang, Ying; Gao, Kun** — *User redirection-aware co-optimization of public charging with local photovoltaics and battery storage.*
 
 ### Demand simulation source
 
